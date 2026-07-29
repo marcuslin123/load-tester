@@ -330,7 +330,7 @@ deploy/
   k8s/          # deployments, services, RBAC
   terraform/    # stretch: EKS provisioning
 docs/
-  superpowers/specs/
+  design.md     # this document
 ```
 
 ---

@@ -24,6 +24,8 @@ func health(w http.ResponseWriter, _ *http.Request) {
 	fmt.Fprintln(w, "ok")
 }
 
+// echo applies the requested latency before returning either a successful
+// response or an injected 503 based on error_rate.
 func echo(w http.ResponseWriter, r *http.Request) {
 	latencyValue, err := queryValue(r, "latency", false)
 	if err != nil {
@@ -59,6 +61,8 @@ func echo(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
 }
 
+// burn keeps the CPU busy for the requested duration so target autoscaling
+// can be tested under CPU pressure.
 func burn(w http.ResponseWriter, r *http.Request) {
 	millisecondsValue, err := queryValue(r, "ms", true)
 	if err != nil {
@@ -72,6 +76,7 @@ func burn(w http.ResponseWriter, r *http.Request) {
 	}
 
 	deadline := time.Now().Add(time.Duration(milliseconds) * time.Millisecond)
+	// Spin instead of sleeping so this endpoint creates measurable CPU pressure.
 	for time.Now().Before(deadline) {
 		select {
 		case <-r.Context().Done():
@@ -83,6 +88,8 @@ func burn(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
 }
 
+// queryValue accepts an omitted optional parameter but rejects empty or
+// repeated values.
 func queryValue(r *http.Request, name string, required bool) (string, error) {
 	values, present := r.URL.Query()[name]
 	if !present {
@@ -133,6 +140,7 @@ func parseBurnMilliseconds(value string) (int, error) {
 	return milliseconds, nil
 }
 
+// wait delays the response but returns early if the client cancels the request.
 func wait(r *http.Request, duration time.Duration) bool {
 	if duration == 0 {
 		return true

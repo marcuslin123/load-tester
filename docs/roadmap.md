@@ -126,7 +126,7 @@ merge operation is the load-bearing assumption of the entire distributed design
 (spec §5) — if merging is wrong, Phase 2 produces confidently wrong fleet
 percentiles.
 
-**Done when:** Merging a histogram of 990 samples at 10ms with one of 10 samples
+**Done when:** Merging a histogram of 989 samples at 10ms with one of 11 samples
 at 100ms yields a p99 of ~100ms — *not* the 55ms that averaging the two p99s
 would give. Offering results to a full buffer never blocks and increments a
 dropped counter instead.

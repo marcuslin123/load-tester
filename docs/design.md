@@ -196,10 +196,14 @@ effectively be load testing itself.
 
 ### Design
 
-1. Each worker maintains an **HDR histogram** of latencies in memory, plus
-   counters: requests sent, succeeded, failed, status-code buckets, bytes read.
-2. Every second it serializes a **delta** and pushes one small message upstream.
-3. The orchestrator **merges** histograms additively.
+1. One collector goroutine per worker continuously drains a buffered channel and
+   owns the live metrics state.
+2. It records every request latency, including failed attempts, in an **HDR
+   histogram**, plus counters for requests sent, succeeded, failed, transport
+   errors, 4xx responses, 5xx responses, exact status codes, and bytes read.
+3. Every second it snapshots and resets that state, then pushes the resulting
+   **delta** upstream.
+4. The orchestrator **merges** histograms and counters additively.
 
 Merged histograms are load-bearing here: **percentiles cannot be averaged.** The
 mean of two workers' p99 values is not the fleet p99. Merging histogram buckets
@@ -207,9 +211,9 @@ produces a mathematically correct global percentile.
 
 ### Backpressure
 
-The worker's internal metrics channel is buffered and **drops oldest on full**,
-incrementing a `dropped_samples` counter that is reported upstream. Metric
-reporting must never block load generation.
+The worker's internal metrics channel is buffered and **drops the incoming sample
+when full**, incrementing a `dropped_samples` counter that is reported upstream.
+Metric reporting must never block load generation.
 
 ---
 
@@ -392,6 +396,26 @@ WebSocket stays a later stretch because it is not request/response. "Latency" an
 time?), and the metrics pipeline, histograms, and both load models currently
 assume a request/response cycle. That is genuine design work, not an additive
 adapter.
+
+### Metrics overflow — drop the incoming sample
+
+**Rejected:** blocking producers; locking to drop the oldest sample; a custom
+lock-free ring buffer.
+
+On a full channel, a non-blocking send drops the incoming sample and increments
+`dropped_samples`. This sacrifices recency to guarantee that metrics bookkeeping
+cannot delay load generation or distort its timing; preserving the newest sample
+is not worth adding contention or queue complexity.
+
+### Metrics collection — one consumer goroutine
+
+**Rejected:** updating shared metrics behind a producer-side mutex; sharding
+collectors before measuring a bottleneck.
+
+One goroutine continuously drains the result channel and owns the histogram and
+counters, keeping request goroutines free of metrics locks. One-second delta
+snapshots provide near-real-time reporting. Collector sharding remains a
+measured follow-up if this single consumer becomes a demonstrated bottleneck.
 
 ### Metric granularity — pre-aggregated 1-second histogram deltas
 

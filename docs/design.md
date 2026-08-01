@@ -178,6 +178,13 @@ substitutes `address`, `service`, `method`, and `message` for `url`/`body`.
 - **`constant-rate` (open model).** Fire at exactly R requests/second regardless
   of whether prior responses have returned. Throughput is an *input*.
 
+For `constant-vus`, the caller owns the run context and its total duration,
+including ramp-up. The first virtual user starts immediately, the last starts at
+the end of the ramp, and each started user remains active until cancellation.
+Requests aborted specifically because the run context ended are excluded from
+metrics: they are neither target successes nor target failures. Results that
+completed before cancellation are still recorded.
+
 The open model is where **coordinated omission** must be handled. A naive
 generator that waits for a slow response before sending the next request silently
 under-reports latency, because the requests it *should* have sent during the

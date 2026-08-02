@@ -42,6 +42,19 @@ func TestMergeCombinesHistogramDistributionsAndCounters(t *testing.T) {
 	}
 }
 
+func TestMergeAddsUnmetDemand(t *testing.T) {
+	t.Parallel()
+
+	merged, err := Merge(
+		Snapshot{UnmetDemand: 3},
+		Snapshot{UnmetDemand: 4},
+	)
+	if err != nil {
+		t.Fatalf("Merge() error = %v", err)
+	}
+	assertCounter(t, "UnmetDemand", merged.UnmetDemand, 7)
+}
+
 func collectRepeatedResults(t *testing.T, count int, result protocol.Result) Snapshot {
 	t.Helper()
 

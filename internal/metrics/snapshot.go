@@ -23,6 +23,7 @@ type Snapshot struct {
 	ServerErrors    uint64
 	BytesRead       uint64
 	DroppedSamples  uint64
+	UnmetDemand     uint64
 	StatusCodes     map[int]uint64
 
 	latencies *hdrhistogram.Histogram
@@ -50,6 +51,7 @@ func Merge(snapshots ...Snapshot) (Snapshot, error) {
 		merged.ServerErrors += snapshot.ServerErrors
 		merged.BytesRead += snapshot.BytesRead
 		merged.DroppedSamples += snapshot.DroppedSamples
+		merged.UnmetDemand += snapshot.UnmetDemand
 		for status, count := range snapshot.StatusCodes {
 			merged.StatusCodes[status] += count
 		}

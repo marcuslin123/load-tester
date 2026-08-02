@@ -154,14 +154,15 @@ accounted for; a long ramp-up demonstrably keeps most users from starting.
 ### Piece 7 — Open-model scheduler (`constant-rate`)
 
 **Goal:** A scheduler that fires at R requests/second regardless of whether prior
-responses have returned, with a bound on in-flight requests.
+responses have returned, with a required bound on in-flight requests.
 
 **Why here:** It depends on Piece 6's plumbing, and it is where the subtlest bug
 in load testing lives.
 
 **Done when:** Against a target far too slow to serve the requested rate,
-reported latencies climb well past the per-request service time, and unmet demand
-surfaces as errors rather than disappearing.
+reported latency includes delay from the intended arrival time, and arrivals
+rejected at the in-flight bound surface as separate unmet demand rather than
+disappearing or being blamed on the target.
 
 **Teaches:** Absolute versus accumulated scheduling, semaphores via buffered
 channels, coordinated omission.

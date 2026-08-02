@@ -245,6 +245,23 @@ func TestNewCollectorRejectsNonPositiveBufferSize(t *testing.T) {
 	}
 }
 
+func TestCollectorCountsUnmetDemandOutsideRequestFailures(t *testing.T) {
+	t.Parallel()
+
+	collector, err := NewCollector(2)
+	if err != nil {
+		t.Fatalf("NewCollector() error = %v", err)
+	}
+	if !collector.OfferUnmetDemand() || !collector.OfferUnmetDemand() {
+		t.Fatal("OfferUnmetDemand() dropped an event despite sufficient buffer capacity")
+	}
+
+	snapshot := collector.Close()
+	assertCounter(t, "UnmetDemand", snapshot.UnmetDemand, 2)
+	assertCounter(t, "Requests", snapshot.Requests, 0)
+	assertCounter(t, "Failed", snapshot.Failed, 0)
+}
+
 func assertCounter(t *testing.T, name string, got, want uint64) {
 	t.Helper()
 

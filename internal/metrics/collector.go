@@ -13,6 +13,7 @@ type eventKind uint8
 
 const (
 	resultEvent eventKind = iota
+	unmetDemandEvent
 	snapshotEvent
 	closeEvent
 )
@@ -54,6 +55,14 @@ func (c *Collector) Offer(result protocol.Result) bool {
 	return offerResult(c.events, &c.dropped, result)
 }
 
+// OfferUnmetDemand records a scheduled arrival that could not become a request.
+func (c *Collector) OfferUnmetDemand() bool {
+	if c.closed.Load() {
+		return false
+	}
+	return offerEvent(c.events, &c.dropped, event{kind: unmetDemandEvent})
+}
+
 // SnapshotAndReset returns the completed interval after all results queued
 // before the snapshot command have been aggregated.
 func (c *Collector) SnapshotAndReset() Snapshot {
@@ -93,6 +102,8 @@ func (c *Collector) run() {
 		switch next.kind {
 		case resultEvent:
 			recordResult(&snapshot, next.result)
+		case unmetDemandEvent:
+			snapshot.UnmetDemand++
 		case snapshotEvent:
 			snapshot.DroppedSamples = c.dropped.Swap(0)
 			next.reply <- snapshot
@@ -106,8 +117,12 @@ func (c *Collector) run() {
 }
 
 func offerResult(events chan<- event, dropped *atomic.Uint64, result protocol.Result) bool {
+	return offerEvent(events, dropped, event{kind: resultEvent, result: result})
+}
+
+func offerEvent(events chan<- event, dropped *atomic.Uint64, next event) bool {
 	select {
-	case events <- event{kind: resultEvent, result: result}:
+	case events <- next:
 		return true
 	default:
 		dropped.Add(1)

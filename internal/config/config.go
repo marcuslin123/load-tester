@@ -41,6 +41,7 @@ type Load struct {
 	Model        string        `yaml:"model"`
 	VirtualUsers int           `yaml:"virtual_users"`
 	Rate         int           `yaml:"rate"`
+	MaxInFlight  int           `yaml:"max_in_flight"`
 	Duration     time.Duration `yaml:"duration"`
 	RampUp       time.Duration `yaml:"ramp_up"`
 }
@@ -68,6 +69,7 @@ type rawLoad struct {
 	Model        string       `yaml:"model"`
 	VirtualUsers int          `yaml:"virtual_users"`
 	Rate         int          `yaml:"rate"`
+	MaxInFlight  int          `yaml:"max_in_flight"`
 	Duration     durationText `yaml:"duration"`
 	RampUp       durationText `yaml:"ramp_up"`
 }
@@ -130,6 +132,7 @@ func (raw rawConfig) toConfig() (Config, error) {
 			Model:        raw.Load.Model,
 			VirtualUsers: raw.Load.VirtualUsers,
 			Rate:         raw.Load.Rate,
+			MaxInFlight:  raw.Load.MaxInFlight,
 			Duration:     loadDuration,
 			RampUp:       rampUp,
 		},
@@ -199,6 +202,12 @@ func validate(cfg Config) error {
 	}
 	if cfg.Load.Model == LoadConstantRate && cfg.Load.Rate <= 0 {
 		return fieldError("load.rate", "must be greater than 0")
+	}
+	if cfg.Load.Model == LoadConstantRate && cfg.Load.MaxInFlight <= 0 {
+		return fieldError("load.max_in_flight", "must be greater than 0")
+	}
+	if cfg.Load.Model == LoadConstantVUs && cfg.Load.MaxInFlight != 0 {
+		return fieldError("load.max_in_flight", "is only valid for constant-rate")
 	}
 	if cfg.Load.Duration <= 0 {
 		return fieldError("load.duration", "must be greater than 0")

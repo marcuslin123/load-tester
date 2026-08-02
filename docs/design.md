@@ -185,6 +185,14 @@ Requests aborted specifically because the run context ended are excluded from
 metrics: they are neither target successes nor target failures. Results that
 completed before cancellation are still recorded.
 
+For `constant-rate`, `max_in_flight` is required. An absolute scheduler computes
+each intended arrival from the run start; `ramp_up` linearly increases the rate
+from zero to the configured target. A non-blocking semaphore admits requests up
+to the in-flight limit. Arrivals rejected at that limit increment a separate
+`unmet_demand` counter rather than becoming target failures or waiting in a
+client-side queue. Admitted request latency is measured from intended arrival
+through response completion.
+
 The open model is where **coordinated omission** must be handled. A naive
 generator that waits for a slow response before sending the next request silently
 under-reports latency, because the requests it *should* have sent during the

@@ -117,6 +117,7 @@ target:
 load:
   model: constant-rate
   rate: 250
+  max_in_flight: 500
   duration: 10s
 fleet:
   min_workers: 1
@@ -131,6 +132,9 @@ fleet:
 	}
 	if cfg.Load.Rate != 250 {
 		t.Fatalf("Load.Rate = %d, want 250", cfg.Load.Rate)
+	}
+	if cfg.Load.MaxInFlight != 500 {
+		t.Fatalf("Load.MaxInFlight = %d, want 500", cfg.Load.MaxInFlight)
 	}
 }
 
@@ -258,6 +262,59 @@ fleet:
   max_workers: 1
 `,
 			want: "load.rate",
+		},
+		{
+			name: "constant rate missing max in flight",
+			yaml: `
+name: missing-max-in-flight
+target:
+  protocol: http
+  url: http://target:8080/echo
+load:
+  model: constant-rate
+  rate: 100
+  duration: 10s
+fleet:
+  min_workers: 1
+  max_workers: 1
+`,
+			want: "load.max_in_flight",
+		},
+		{
+			name: "constant rate negative max in flight",
+			yaml: `
+name: negative-max-in-flight
+target:
+  protocol: http
+  url: http://target:8080/echo
+load:
+  model: constant-rate
+  rate: 100
+  max_in_flight: -1
+  duration: 10s
+fleet:
+  min_workers: 1
+  max_workers: 1
+`,
+			want: "load.max_in_flight",
+		},
+		{
+			name: "constant vus rejects max in flight",
+			yaml: `
+name: closed-with-max-in-flight
+target:
+  protocol: http
+  url: http://target:8080/echo
+load:
+  model: constant-vus
+  virtual_users: 10
+  max_in_flight: 20
+  duration: 10s
+fleet:
+  min_workers: 1
+  max_workers: 1
+`,
+			want: "load.max_in_flight",
 		},
 		{
 			name: "unknown field",

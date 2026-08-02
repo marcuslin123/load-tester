@@ -152,13 +152,14 @@ func parseDurationField(field, value string) (time.Duration, error) {
 }
 
 func parseOptionalDurationField(field, value string) (time.Duration, error) {
-	if strings.TrimSpace(value) == "" {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" || trimmed == "0" {
 		return 0, nil
 	}
-	if !durationPattern.MatchString(value) {
+	if !durationPattern.MatchString(trimmed) {
 		return 0, fieldError(field, "must include a duration unit such as ms, s, or m")
 	}
-	parsed, err := time.ParseDuration(value)
+	parsed, err := time.ParseDuration(trimmed)
 	if err != nil {
 		return 0, fieldError(field, err.Error())
 	}

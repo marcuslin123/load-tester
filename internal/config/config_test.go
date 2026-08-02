@@ -108,6 +108,30 @@ fleet:
 	}
 }
 
+func TestParseAcceptsZeroToDisableP99Threshold(t *testing.T) {
+	cfg, err := Parse(strings.NewReader(`
+name: disabled-p99
+target:
+  protocol: http
+  url: http://target:8080/echo
+load:
+  model: constant-vus
+  virtual_users: 1
+  duration: 10s
+fleet:
+  min_workers: 1
+  max_workers: 1
+thresholds:
+  p99_latency: 0
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if cfg.Thresholds.P99Latency != 0 {
+		t.Fatalf("P99Latency = %v, want disabled zero value", cfg.Thresholds.P99Latency)
+	}
+}
+
 func TestParseReadsConstantRateConfig(t *testing.T) {
 	cfg, err := Parse(strings.NewReader(`
 name: rate-smoke

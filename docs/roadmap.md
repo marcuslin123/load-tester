@@ -190,6 +190,14 @@ error rate (spec §8).
 Distinct exit codes are what make the tool usable in CI, and CI usability is a
 concrete thing to point at in an interview.
 
+**Design decisions:** Keep `cmd/loadtest` thin: reusable internal runner and
+report packages own orchestration and summary evaluation. Print text output for
+this milestone. Exit 0 on pass, 1 when a completed test fails, 2 on usage,
+configuration, or preflight failure, and 130 on Ctrl+C. One configurable,
+unmeasured configured request checks reachability before the timed run. Unmet
+demand, dropped samples, and zero completed requests invalidate the final
+result in addition to configured p99 and error-rate thresholds.
+
 ### Piece 9 — Oracle integration test **(Phase 1 gate)**
 
 **Goal:** An automated test asserting that measured percentiles match the

@@ -199,6 +199,28 @@ under-reports latency, because the requests it *should* have sent during the
 stall are never measured. The fix: schedule each request against its *intended*
 send time and measure latency from that timestamp, not from actual dispatch.
 
+### Local CLI execution
+
+`cmd/loadtest` joins the local configuration, protocol, scheduler, and metrics
+packages. Before starting the timed run, it sends one unmeasured configured
+request with a five-second timeout by default. Transport, DNS, TLS, timeout, and
+response-read failures abort setup, while an HTTP 4xx or 5xx still proves that
+the target is reachable. The timeout is configurable with
+`-preflight-timeout`.
+
+The exact configured request is useful for validating the route and method, but
+it can have side effects for operations such as POST or DELETE. Local runs
+should therefore target disposable environments. A future version may support
+a separate health URL, disabled preflight, and idempotency headers; silently
+changing the configured method to GET or HEAD could validate the wrong route.
+
+Normal completion prints a text summary and evaluates enabled p99 latency and
+error-rate thresholds. Equality passes and a zero threshold disables that
+check. Any unmet demand, dropped metric samples, or a run with no completed
+requests fails because the result is incomplete or unreliable. Ctrl+C cancels
+scheduling and in-flight requests, prints an `INTERRUPTED` partial summary
+without threshold evaluation, and exits with the conventional status 130.
+
 ---
 
 ## 5. Metrics pipeline

@@ -217,6 +217,13 @@ timing-dependent assertions.
 That last assertion is the one Phase 2 rests on: merging per-worker snapshots
 must equal measuring the whole thing at once.
 
+**Design decisions:** Exercise the real YAML-to-runner pipeline against an
+in-process target for three seconds. With 20 virtual users and 50ms injected
+latency, accept p50/p95/p99 upper bounds of 65ms/80ms/100ms, throughput within
+20% of Little's Law, and a 20% injected error rate within five percentage
+points. Verify merge equivalence separately by feeding identical real HTTP
+results into three batch collectors and one combined collector.
+
 ---
 
 ## Phase 2 — Two processes talking

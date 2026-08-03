@@ -343,6 +343,13 @@ scheduler timing under simulated clock.
 matches injected latency within tolerance. This is the correctness oracle for the
 entire metrics pipeline.
 
+The Phase 1 oracle runs the local pipeline for three seconds with 20 virtual
+users against a target injecting 50ms latency and a 20% error rate. Accepted
+ranges are 50–65ms for p50, 50–80ms for p95, 50–100ms for p99, 320–480
+requests/second, and 15–25% measured errors. Histogram merge equivalence uses
+the same real HTTP observations in three batch collectors and one combined
+collector, so merged and directly aggregated percentiles must match exactly.
+
 **End-to-end.** `docker compose up`, run a test, assert Prometheus contains the
 expected series.
 

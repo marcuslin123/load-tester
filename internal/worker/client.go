@@ -206,9 +206,10 @@ func runRegistered(
 ) error {
 	outbound := make(chan *loadtestv1.WorkerMessage, outboundBufferSize)
 	errors := make(chan error, 2)
+	assignments := newAssignmentState()
 	go writeMessages(ctx, stream, outbound, errors)
-	go produceHeartbeats(ctx, workerID, heartbeatInterval, dependencies.now, outbound)
-	go receiveMessages(ctx, stream, dependencies.logger, errors)
+	go produceHeartbeats(ctx, workerID, heartbeatInterval, dependencies.now, assignments, outbound)
+	go receiveMessages(ctx, stream, assignments, dependencies.logger, errors)
 
 	select {
 	case <-ctx.Done():
@@ -244,6 +245,7 @@ func produceHeartbeats(
 	workerID string,
 	interval time.Duration,
 	now func() time.Time,
+	assignments *assignmentState,
 	outbound chan<- *loadtestv1.WorkerMessage,
 ) {
 	ticker := time.NewTicker(interval)
@@ -253,12 +255,15 @@ func produceHeartbeats(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			runID, revision := assignments.Status()
 			message := &loadtestv1.WorkerMessage{Payload: &loadtestv1.WorkerMessage_Heartbeat{
 				Heartbeat: &loadtestv1.Heartbeat{
-					WorkerId: workerID,
-					Sequence: sequence,
-					SentAt:   timestamppb.New(now()),
-					State:    loadtestv1.WorkerState_WORKER_STATE_IDLE,
+					WorkerId:                  workerID,
+					Sequence:                  sequence,
+					SentAt:                    timestamppb.New(now()),
+					State:                     loadtestv1.WorkerState_WORKER_STATE_IDLE,
+					ActiveRunId:               runID,
+					AppliedAssignmentRevision: revision,
 				},
 			}}
 			select {
@@ -273,6 +278,7 @@ func produceHeartbeats(
 func receiveMessages(
 	ctx context.Context,
 	stream loadtestv1.WorkerControl_ConnectClient,
+	assignments *assignmentState,
 	logger *log.Logger,
 	errors chan<- error,
 ) {
@@ -282,7 +288,16 @@ func receiveMessages(
 			reportStreamError(ctx, errors, err)
 			return
 		}
-		logger.Printf("orchestrator message received: %T", message.GetPayload())
+		assignment := message.GetAssignment()
+		if assignment == nil {
+			reportStreamError(ctx, errors, status.Error(codes.FailedPrecondition, "only load assignments are accepted after registration"))
+			return
+		}
+		if err := assignments.Apply(assignment); err != nil {
+			reportStreamError(ctx, errors, err)
+			return
+		}
+		logger.Printf("assignment applied: run_id=%s revision=%d", assignment.GetRunId(), assignment.GetRevision())
 	}
 }
 

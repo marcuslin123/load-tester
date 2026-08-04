@@ -300,6 +300,17 @@ recompute and re-push when a third worker joins mid-run.
 
 **Teaches:** gRPC servers, concurrent map access, integer division edge cases.
 
+**Design decisions:** `cmd/orchestrator` requires the existing YAML config and
+waits for `fleet.min_workers`. A single coordinator goroutine owns a random run
+ID, revision sequence, and a one-second-ahead start; rebalances retain the
+original start and deadline. Worker-ID ordering makes quotient-and-remainder
+splits deterministic. Constant-rate participation is capped by rate and
+`max_in_flight`, with explicit zero-load assignments for surplus workers.
+Workers validate and retain the newest complete assignment and acknowledge its
+run ID and revision through idle heartbeats. Only joins trigger rebalancing in
+this piece; failed sends remove sessions, while departure recovery remains Piece
+14.
+
 ### Piece 13 — Metric deltas flow upstream and merge
 
 **Goal:** Workers ship one aggregated delta per second; the orchestrator merges

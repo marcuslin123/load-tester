@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,41 +16,88 @@ import (
 	"time"
 
 	loadtestv1 "github.com/marcuslin123/load-tester/gen/loadtest/v1"
+	loadconfig "github.com/marcuslin123/load-tester/internal/config"
 	"github.com/marcuslin123/load-tester/internal/orchestrator"
 	"google.golang.org/grpc"
 )
 
-const heartbeatInterval = 3 * time.Second
+const (
+	heartbeatInterval  = 3 * time.Second
+	assignmentLeadTime = time.Second
+)
+
+type cliOptions struct {
+	address    string
+	configPath string
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	address, err := parseAddress(os.Args[1:])
+	options, err := parseOptions(os.Args[1:])
 	if err != nil {
 		log.Printf("orchestrator: %v", err)
 		os.Exit(2)
 	}
-	if err := run(ctx, address, log.Default()); err != nil {
+	cfg, err := loadTestConfig(options.configPath)
+	if err != nil {
+		log.Printf("orchestrator: %v", err)
+		os.Exit(2)
+	}
+	runID, err := newRunID()
+	if err != nil {
+		log.Printf("orchestrator: generate run ID: %v", err)
+		os.Exit(1)
+	}
+	if err := run(ctx, options.address, cfg, runID, log.Default()); err != nil {
 		log.Printf("orchestrator: %v", err)
 		os.Exit(1)
 	}
 }
 
-func parseAddress(args []string) (string, error) {
+func parseOptions(args []string) (cliOptions, error) {
 	flags := flag.NewFlagSet("orchestrator", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	address := flags.String("addr", ":9090", "gRPC listen address")
+	configPath := flags.String("config", "", "path to the load-test YAML file")
 	if err := flags.Parse(args); err != nil {
-		return "", err
+		return cliOptions{}, err
 	}
 	if flags.NArg() != 0 {
-		return "", fmt.Errorf("unexpected arguments: %v", flags.Args())
+		return cliOptions{}, fmt.Errorf("unexpected arguments: %v", flags.Args())
 	}
-	return *address, nil
+	if *configPath == "" {
+		return cliOptions{}, errors.New("-config is required")
+	}
+	return cliOptions{address: *address, configPath: *configPath}, nil
 }
 
-func run(ctx context.Context, address string, logger *log.Logger) error {
+func loadTestConfig(path string) (loadconfig.Config, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return loadconfig.Config{}, fmt.Errorf("open config: %w", err)
+	}
+	cfg, parseErr := loadconfig.Parse(file)
+	closeErr := file.Close()
+	if parseErr != nil {
+		return loadconfig.Config{}, parseErr
+	}
+	if closeErr != nil {
+		return loadconfig.Config{}, fmt.Errorf("close config: %w", closeErr)
+	}
+	return cfg, nil
+}
+
+func newRunID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(value[:]), nil
+}
+
+func run(ctx context.Context, address string, cfg loadconfig.Config, runID string, logger *log.Logger) error {
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", address, err)
@@ -58,6 +107,12 @@ func run(ctx context.Context, address string, logger *log.Logger) error {
 	control, err := orchestrator.NewServer(orchestrator.Options{
 		HeartbeatInterval: heartbeatInterval,
 		Logger:            logger,
+		Assignment: &orchestrator.AssignmentOptions{
+			Context:  ctx,
+			Config:   cfg,
+			RunID:    runID,
+			LeadTime: assignmentLeadTime,
+		},
 	})
 	if err != nil {
 		return fmt.Errorf("create worker control server: %w", err)
@@ -69,7 +124,7 @@ func run(ctx context.Context, address string, logger *log.Logger) error {
 		server.Stop()
 	}()
 
-	logger.Printf("orchestrator listening: address=%s", listener.Addr())
+	logger.Printf("orchestrator listening: address=%s run_id=%s min_workers=%d", listener.Addr(), runID, cfg.Fleet.MinWorkers)
 	err = server.Serve(listener)
 	if ctx.Err() != nil || errors.Is(err, grpc.ErrServerStopped) {
 		return nil

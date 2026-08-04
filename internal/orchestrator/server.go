@@ -22,6 +22,11 @@ import (
 type Options struct {
 	HeartbeatInterval time.Duration
 	Logger            *log.Logger
+	Assignment        *AssignmentOptions
+}
+
+type serverDependencies struct {
+	now func() time.Time
 }
 
 // WorkerSnapshot is a read-only view of one active worker session.
@@ -60,23 +65,41 @@ type Server struct {
 
 	mu       sync.RWMutex
 	sessions map[string]*session
+
+	assignments *assignmentCoordinator
 }
 
 // NewServer creates a registration server with no active workers.
 func NewServer(options Options) (*Server, error) {
+	return newServer(options, serverDependencies{now: time.Now})
+}
+
+func newServer(options Options, dependencies serverDependencies) (*Server, error) {
 	if options.HeartbeatInterval <= 0 {
 		return nil, errors.New("heartbeat interval must be greater than zero")
+	}
+	if dependencies.now == nil {
+		return nil, errors.New("clock is required")
 	}
 	logger := options.Logger
 	if logger == nil {
 		logger = log.New(io.Discard, "", 0)
 	}
-	return &Server{
+	server := &Server{
 		heartbeatInterval: options.HeartbeatInterval,
 		logger:            logger,
-		now:               time.Now,
+		now:               dependencies.now,
 		sessions:          make(map[string]*session),
-	}, nil
+	}
+	if options.Assignment != nil {
+		coordinator, err := newAssignmentCoordinator(server, *options.Assignment, dependencies.now)
+		if err != nil {
+			return nil, err
+		}
+		server.assignments = coordinator
+		go coordinator.run(options.Assignment.Context)
+	}
+	return server, nil
 }
 
 // Connect requires registration first, then records ordered heartbeats until disconnect.
@@ -121,6 +144,9 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[loadtestv1.WorkerMessag
 		return err
 	}
 	s.logger.Printf("worker registered: id=%s hostname=%s version=%s", workerID, worker.state.Hostname, worker.state.SoftwareVersion)
+	if s.assignments != nil {
+		s.assignments.membershipChanged()
+	}
 
 	for {
 		message, err := stream.Recv()
@@ -164,13 +190,18 @@ func (s *Server) addSession(workerID string, worker *session) bool {
 	return true
 }
 
-func (s *Server) removeSession(workerID string, worker *session) {
+func (s *Server) removeSession(workerID string, worker *session) bool {
 	s.mu.Lock()
+	removed := false
 	if s.sessions[workerID] == worker {
 		delete(s.sessions, workerID)
+		removed = true
 	}
 	s.mu.Unlock()
-	s.logger.Printf("worker disconnected: id=%s", workerID)
+	if removed {
+		s.logger.Printf("worker disconnected: id=%s", workerID)
+	}
+	return removed
 }
 
 func (s *Server) recordHeartbeat(workerID string, worker *session, heartbeat *loadtestv1.Heartbeat) error {

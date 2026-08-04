@@ -63,6 +63,47 @@ func TestRunRegistersAndSendsOrderedHeartbeats(t *testing.T) {
 	}
 }
 
+func TestRunReportsAppliedAssignmentInHeartbeat(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	server := &testControlServer{
+		handle: func(stream grpc.BidiStreamingServer[loadtestv1.WorkerMessage, loadtestv1.OrchestratorMessage], _ int) error {
+			if _, err := stream.Recv(); err != nil {
+				return err
+			}
+			if err := stream.Send(registrationAck("worker-1", 5*time.Millisecond)); err != nil {
+				return err
+			}
+			if err := stream.Send(&loadtestv1.OrchestratorMessage{Payload: &loadtestv1.OrchestratorMessage_Assignment{
+				Assignment: validAssignment("run-12", 2, 50),
+			}}); err != nil {
+				return err
+			}
+			for {
+				message, err := stream.Recv()
+				if err != nil {
+					return err
+				}
+				heartbeat := message.GetHeartbeat()
+				if heartbeat == nil {
+					continue
+				}
+				if heartbeat.GetActiveRunId() == "run-12" && heartbeat.GetAppliedAssignmentRevision() == 2 {
+					if heartbeat.GetState() != loadtestv1.WorkerState_WORKER_STATE_IDLE {
+						return status.Errorf(codes.InvalidArgument, "state = %v, want IDLE", heartbeat.GetState())
+					}
+					cancel()
+					return nil
+				}
+			}
+		},
+	}
+	dependencies := startWorkerTestServer(t, server)
+
+	if err := run(ctx, validConfig(), Options{}, dependencies); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+}
+
 func TestRunRetriesUnavailableRegistration(t *testing.T) {
 	t.Parallel()
 

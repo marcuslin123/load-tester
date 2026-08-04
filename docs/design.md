@@ -456,6 +456,25 @@ arguments and authentication or permission failures are permanent. Local Phase
 2 transport is plaintext inside a trusted development network; external TLS and
 authentication remain deployment concerns.
 
+The orchestrator reads the validated load-test file at startup and waits for
+`fleet.min_workers` before creating a run. One coordinator goroutine serializes
+membership changes and assignment revisions. The initial assignment starts one
+second in the future, and every rebalance preserves the run ID, original start,
+and original deadline so added workers receive only the remaining test window.
+
+Workers are ordered by ID before quotient-and-remainder load splitting, making
+remainder placement deterministic without dropping demand. Constant-rate load
+is divided among at most `min(worker count, rate, max_in_flight)` active workers;
+surplus workers receive an explicit zero-load replacement assignment. A worker
+validates and retains only complete, non-stale assignments and reports the
+accepted run ID and revision in later heartbeats. Piece 12 leaves workers idle;
+Piece 13 applies those assignments to load generation and metric reporting.
+
+Joining workers trigger rebalances, but assignment delivery failures and worker
+departures do not redistribute load until Piece 14 adds failure detection and
+recovery. Failed sends remove the affected active session, and workers joining
+after the original deadline remain connected but idle.
+
 ### Target protocol — HTTP in Layer 1, gRPC in Week 5
 
 **Rejected:** building HTTP, gRPC, and WebSocket simultaneously.
@@ -596,24 +615,3 @@ executed at the end of every cloud session —
 
 **Scope creep into later layers.** The stretch list exists to park ideas, not to
 build them. Layer 1 is done when the Week-4 deliverables are complete.
-
----
-
-## 14. Resume framing
-
-Placeholders `X`, `Y`, and the throughput figures must be replaced with numbers
-actually measured during the Week-4 EKS run.
-
-```
-Distributed Load Testing Platform | Go, gRPC, Docker, Kubernetes, AWS, Prometheus, Grafana
-
-- Orchestrated X containerized workers in Go via gRPC streaming to generate Y
-  concurrent requests against target services, validating autoscaling policies
-  under sustained load
-- Designed auto-scaling fleet management abstracted over Docker and EKS,
-  dynamically provisioning workers based on real-time load demand and worker
-  health status
-- Instrumented end-to-end observability with Prometheus metrics and Grafana
-  dashboards, capturing latency percentiles (p50/p95/p99), throughput, and error
-  rates across distributed workers
-```

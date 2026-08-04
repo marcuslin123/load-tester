@@ -158,11 +158,30 @@ func TestServerRejectsNonIncreasingHeartbeatSequence(t *testing.T) {
 
 func startTestServer(t *testing.T) (*Server, loadtestv1.WorkerControlClient) {
 	t.Helper()
-
-	service, err := NewServer(Options{
+	return startTestServerWithOptions(t, Options{
 		HeartbeatInterval: 3 * time.Second,
 		Logger:            log.New(io.Discard, "", 0),
-	})
+	}, serverDependencies{now: time.Now})
+}
+
+func startTestServerWithOptions(
+	t *testing.T,
+	options Options,
+	dependencies serverDependencies,
+) (*Server, loadtestv1.WorkerControlClient) {
+	t.Helper()
+	if options.Logger == nil {
+		options.Logger = log.New(io.Discard, "", 0)
+	}
+	if options.Assignment != nil && options.Assignment.Context == nil {
+		assignment := *options.Assignment
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		assignment.Context = ctx
+		options.Assignment = &assignment
+	}
+
+	service, err := newServer(options, dependencies)
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
 	}

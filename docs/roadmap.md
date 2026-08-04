@@ -278,6 +278,15 @@ with backoff instead of crashing.
 
 **Teaches:** gRPC clients, streams, connection lifecycle, retry with backoff.
 
+**Design decisions:** Add a registration-only `cmd/orchestrator` in this piece.
+Workers require `ORCHESTRATOR_ADDR`, use optional `WORKER_ID` or their hostname,
+and send registration followed by sequenced idle heartbeats every interval in
+the acknowledgment. The orchestrator rejects invalid or duplicate identities,
+tracks heartbeat state, and removes disconnected sessions. Retryable stream
+failures reconnect indefinitely with jittered exponential backoff from 500ms to
+10s; permanent protocol and authorization errors stop the worker. Phase 2 uses
+plaintext gRPC locally.
+
 ### Piece 12 — Orchestrator assigns load slices
 
 **Goal:** `cmd/orchestrator` — accept worker streams, divide the configured load

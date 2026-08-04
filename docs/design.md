@@ -441,6 +441,21 @@ This eliminates service discovery entirely. Workers need one environment
 variable, and the same code works identically under Compose and Kubernetes with
 no DNS or headless-service configuration.
 
+The worker requires `ORCHESTRATOR_ADDR`; `WORKER_ID` optionally overrides the
+host or container name used as its process-stable identity. A registration-only
+orchestrator accepts the first stream message, rejects empty or duplicate IDs,
+acknowledges the worker with a three-second heartbeat interval, and removes the
+session when its stream closes. Registered workers send sequenced `IDLE`
+heartbeats through one outbound writer, establishing the send serialization that
+later metric deltas reuse.
+
+Streaming RPCs are recreated by the application after connection loss. Retryable
+transport, EOF, deadline, and duplicate-ID failures use jittered exponential
+backoff from 500ms to 10s and reset after registration succeeds. Invalid
+arguments and authentication or permission failures are permanent. Local Phase
+2 transport is plaintext inside a trusted development network; external TLS and
+authentication remain deployment concerns.
+
 ### Target protocol — HTTP in Layer 1, gRPC in Week 5
 
 **Rejected:** building HTTP, gRPC, and WebSocket simultaneously.

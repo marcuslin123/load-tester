@@ -408,6 +408,24 @@ in a single mechanism — a broken TCP stream *is* the liveness signal, so no
 separate health-check endpoint is needed, and protobuf generates both client and
 server code from one schema.
 
+The versioned `loadtest.v1.WorkerControl.Connect` stream uses typed `oneof`
+envelopes. Workers send registration, one-second metric deltas, and heartbeats;
+the orchestrator sends registration acknowledgment, complete versioned load
+assignments, and stop commands. Workers supply a process-stable ID, and the
+orchestrator acknowledges it with the heartbeat interval. Assignments contain
+absolute start and deadline timestamps plus a monotonically increasing revision,
+so rebalances replace state idempotently without restarting the test window.
+The assignment target is itself a protocol `oneof`, allowing the planned gRPC
+target adapter to be added without changing the assignment's field numbers.
+
+Metric deltas identify the worker, run, assignment revision, interval, and
+sequence number. Counters and status-code counts travel alongside a compact HDR
+V2 encoded histogram, preserving exact mergeability without sending individual
+request observations. Heartbeats report worker state, the applied assignment
+revision, and in-flight requests. Protobuf field numbers are permanent within
+`v1`: new fields may be added, but existing numbers are never renumbered or
+reused.
+
 HTTP polling would require the orchestrator to know every worker's address
 (service discovery in both environments), deliver stale metrics, delay commands
 until the next poll, and need a separate liveness check. Bidirectional REST would

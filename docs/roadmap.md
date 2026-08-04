@@ -251,6 +251,17 @@ Requires installing `protoc` and the Go plugins. Committing the generation
 command matters — regenerating by half-remembered incantation is how wire formats
 drift.
 
+**Design decisions:** Use a versioned `loadtest.v1` package and one
+bidirectional `WorkerControl.Connect` RPC with typed `oneof` envelopes. Workers
+supply their IDs and send registration, metric deltas, and operational
+heartbeats; the orchestrator sends registration acknowledgment, complete
+revisioned assignments, and stop commands. Assignments carry an absolute start
+and deadline, with an extensible target-protocol `oneof`. Metric deltas carry
+sequence numbers, counters, status-code maps,
+and HDR V2 encoded histogram bytes. A committed script pins the Go generators,
+supports generate and stale-code check modes, and writes committed Go code under
+`gen/loadtest/v1`.
+
 ### Piece 11 — Worker dials out and registers
 
 **Goal:** `cmd/worker` — on startup, dial the orchestrator address from an

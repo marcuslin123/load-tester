@@ -1,0 +1,145 @@
+syntax = "proto3";
+
+package loadtest.v1;
+
+option go_package = "github.com/marcuslin123/load-tester/gen/loadtest/v1;loadtestv1";
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// WorkerControl carries the lifetime of one worker connection in both directions.
+service WorkerControl {
+  rpc Connect(stream WorkerMessage) returns (stream OrchestratorMessage);
+}
+
+enum WorkerState {
+  WORKER_STATE_UNSPECIFIED = 0;
+  WORKER_STATE_IDLE = 1;
+  WORKER_STATE_RUNNING = 2;
+  WORKER_STATE_STOPPING = 3;
+}
+
+enum LoadModel {
+  LOAD_MODEL_UNSPECIFIED = 0;
+  LOAD_MODEL_CONSTANT_VUS = 1;
+  LOAD_MODEL_CONSTANT_RATE = 2;
+}
+
+enum HistogramEncoding {
+  HISTOGRAM_ENCODING_UNSPECIFIED = 0;
+  HISTOGRAM_ENCODING_HDR_V2_COMPRESSED = 1;
+}
+
+enum StopReason {
+  STOP_REASON_UNSPECIFIED = 0;
+  STOP_REASON_COMPLETED = 1;
+  STOP_REASON_CANCELED = 2;
+  STOP_REASON_THRESHOLD_VIOLATION = 3;
+  STOP_REASON_ORCHESTRATOR_SHUTDOWN = 4;
+}
+
+// Registration must be the first message sent on a new worker stream.
+message Registration {
+  string worker_id = 1;
+  string hostname = 2;
+  string software_version = 3;
+}
+
+// RegistrationAck confirms that the orchestrator accepted the worker identity.
+message RegistrationAck {
+  string worker_id = 1;
+  google.protobuf.Duration heartbeat_interval = 2;
+}
+
+message HttpTarget {
+  string url = 1;
+  string method = 2;
+  map<string, string> headers = 3;
+  bytes body = 4;
+}
+
+// Target keeps assignment field numbers stable as target protocols are added.
+message Target {
+  oneof protocol {
+    HttpTarget http = 1;
+  }
+}
+
+// LoadSlice is the portion of fleet-wide load assigned to one worker.
+message LoadSlice {
+  LoadModel model = 1;
+  uint64 virtual_users = 2;
+  uint64 rate = 3;
+  uint64 max_in_flight = 4;
+  google.protobuf.Duration ramp_up = 5;
+}
+
+// LoadAssignment completely replaces any older assignment for the same run.
+message LoadAssignment {
+  string run_id = 1;
+  uint64 revision = 2;
+  Target target = 3;
+  LoadSlice load = 4;
+  google.protobuf.Timestamp starts_at = 5;
+  google.protobuf.Timestamp deadline = 6;
+}
+
+message MetricCounters {
+  uint64 requests = 1;
+  uint64 succeeded = 2;
+  uint64 failed = 3;
+  uint64 transport_errors = 4;
+  uint64 client_errors = 5;
+  uint64 server_errors = 6;
+  uint64 bytes_read = 7;
+  uint64 dropped_samples = 8;
+  uint64 unmet_demand = 9;
+  map<int32, uint64> status_codes = 10;
+}
+
+// MetricsDelta contains one reporting interval and is sequenced per worker and run.
+message MetricsDelta {
+  string worker_id = 1;
+  string run_id = 2;
+  uint64 assignment_revision = 3;
+  uint64 sequence = 4;
+  google.protobuf.Timestamp interval_start = 5;
+  google.protobuf.Timestamp interval_end = 6;
+  MetricCounters counters = 7;
+  HistogramEncoding histogram_encoding = 8;
+  bytes latency_histogram = 9;
+}
+
+// Heartbeat reports liveness and the newest assignment applied by the worker.
+message Heartbeat {
+  string worker_id = 1;
+  uint64 sequence = 2;
+  google.protobuf.Timestamp sent_at = 3;
+  WorkerState state = 4;
+  string active_run_id = 5;
+  uint64 applied_assignment_revision = 6;
+  uint64 in_flight_requests = 7;
+}
+
+message StopCommand {
+  string run_id = 1;
+  StopReason reason = 2;
+}
+
+// WorkerMessage is worker-to-orchestrator traffic on the Connect stream.
+message WorkerMessage {
+  oneof payload {
+    Registration registration = 1;
+    MetricsDelta metrics = 2;
+    Heartbeat heartbeat = 3;
+  }
+}
+
+// OrchestratorMessage is orchestrator-to-worker traffic on the Connect stream.
+message OrchestratorMessage {
+  oneof payload {
+    RegistrationAck registration_ack = 1;
+    LoadAssignment assignment = 2;
+    StopCommand stop = 3;
+  }
+}

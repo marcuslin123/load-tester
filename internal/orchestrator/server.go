@@ -12,6 +12,7 @@ import (
 	"time"
 
 	loadtestv1 "github.com/marcuslin123/load-tester/gen/loadtest/v1"
+	"github.com/marcuslin123/load-tester/internal/metrics"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -67,6 +68,7 @@ type Server struct {
 	sessions map[string]*session
 
 	assignments *assignmentCoordinator
+	metrics     *metricsAggregator
 }
 
 // NewServer creates a registration server with no active workers.
@@ -92,6 +94,7 @@ func newServer(options Options, dependencies serverDependencies) (*Server, error
 		sessions:          make(map[string]*session),
 	}
 	if options.Assignment != nil {
+		server.metrics = newMetricsAggregator(options.Assignment.RunID)
 		coordinator, err := newAssignmentCoordinator(server, *options.Assignment, dependencies.now)
 		if err != nil {
 			return nil, err
@@ -156,13 +159,19 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[loadtestv1.WorkerMessag
 			}
 			return err
 		}
-		heartbeat := message.GetHeartbeat()
-		if heartbeat == nil {
-			return status.Error(codes.FailedPrecondition, "only heartbeats are accepted after registration")
+		if heartbeat := message.GetHeartbeat(); heartbeat != nil {
+			if err := s.recordHeartbeat(workerID, worker, heartbeat); err != nil {
+				return err
+			}
+			continue
 		}
-		if err := s.recordHeartbeat(workerID, worker, heartbeat); err != nil {
-			return err
+		if delta := message.GetMetrics(); delta != nil && s.metrics != nil {
+			if err := s.metrics.Accept(workerID, delta); err != nil {
+				return status.Error(codes.InvalidArgument, err.Error())
+			}
+			continue
 		}
+		return status.Error(codes.FailedPrecondition, "only heartbeats and metric deltas are accepted after registration")
 	}
 }
 
@@ -178,6 +187,14 @@ func (s *Server) ActiveWorkers() []WorkerSnapshot {
 		return strings.Compare(left.ID, right.ID)
 	})
 	return workers
+}
+
+// WorkerMetrics returns independent cumulative snapshots for diagnostics and reporting.
+func (s *Server) WorkerMetrics() map[string]metrics.Snapshot {
+	if s.metrics == nil {
+		return map[string]metrics.Snapshot{}
+	}
+	return s.metrics.WorkerSnapshots()
 }
 
 func (s *Server) addSession(workerID string, worker *session) bool {

@@ -105,6 +105,39 @@ func TestRunOpenUsesAbsoluteDeadlines(t *testing.T) {
 	}
 }
 
+func TestRunOpenSkipsArrivalsBeforeAbsoluteStartPosition(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := time.Date(2026, time.August, 2, 12, 0, 0, 0, time.UTC)
+	clock := &scriptedClock{now: started.Add(2500 * time.Millisecond), arrivals: 3, cancel: cancel}
+	executor := protocolFunc(func(context.Context) protocol.Result {
+		return protocol.Result{StatusCode: 200}
+	})
+
+	err := runOpen(ctx, executor, newOpenCountingSink(), OpenOptions{
+		Rate:        2,
+		MaxInFlight: 2,
+		StartAt:     started,
+	}, clock)
+	if err != nil {
+		t.Fatalf("runOpen() error = %v", err)
+	}
+
+	want := []time.Time{
+		started.Add(2500 * time.Millisecond),
+		started.Add(3 * time.Second),
+		started.Add(3500 * time.Millisecond),
+	}
+	deadlines := clock.recordedDeadlines()
+	if len(deadlines) != len(want) {
+		t.Fatalf("scheduled deadlines = %v, want %v", deadlines, want)
+	}
+	for index := range want {
+		if !deadlines[index].Equal(want[index]) {
+			t.Errorf("deadline %d = %v, want %v", index, deadlines[index], want[index])
+		}
+	}
+}
+
 func TestRunOpenRequestMeasuresFromIntendedArrival(t *testing.T) {
 	t.Parallel()
 

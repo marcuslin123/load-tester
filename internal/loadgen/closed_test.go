@@ -70,6 +70,27 @@ func TestRunClosedStaggersUsersAcrossRampUp(t *testing.T) {
 	}
 }
 
+func TestRunClosedStartsUsersAlreadyDueFromAbsoluteStart(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	executor := newBlockingProtocol(3)
+	done := make(chan error, 1)
+	go func() {
+		done <- RunClosed(ctx, executor, &countingSink{}, ClosedOptions{
+			VirtualUsers: 3,
+			RampUp:       time.Hour,
+			StartAt:      time.Now().Add(-time.Hour),
+		})
+	}()
+
+	for range 3 {
+		waitForSignal(t, executor.started)
+	}
+	cancel()
+	if err := waitForRun(t, done); err != nil {
+		t.Fatalf("RunClosed() error = %v", err)
+	}
+}
+
 func TestRunClosedRecordsCompletedResultWhenCancellationRacesWithReturn(t *testing.T) {
 	t.Parallel()
 

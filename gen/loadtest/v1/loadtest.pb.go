@@ -764,6 +764,7 @@ type MetricsDelta struct {
 	Counters           *MetricCounters        `protobuf:"bytes,7,opt,name=counters,proto3" json:"counters,omitempty"`
 	HistogramEncoding  HistogramEncoding      `protobuf:"varint,8,opt,name=histogram_encoding,json=histogramEncoding,proto3,enum=loadtest.v1.HistogramEncoding" json:"histogram_encoding,omitempty"`
 	LatencyHistogram   []byte                 `protobuf:"bytes,9,opt,name=latency_histogram,json=latencyHistogram,proto3" json:"latency_histogram,omitempty"`
+	FinalForRevision   bool                   `protobuf:"varint,10,opt,name=final_for_revision,json=finalForRevision,proto3" json:"final_for_revision,omitempty"`
 	unknownFields      protoimpl.UnknownFields
 	sizeCache          protoimpl.SizeCache
 }
@@ -859,6 +860,13 @@ func (x *MetricsDelta) GetLatencyHistogram() []byte {
 		return x.LatencyHistogram
 	}
 	return nil
+}
+
+func (x *MetricsDelta) GetFinalForRevision() bool {
+	if x != nil {
+		return x.FinalForRevision
+	}
+	return false
 }
 
 // Heartbeat reports liveness and the newest assignment applied by the worker.
@@ -1257,7 +1265,7 @@ const file_loadtest_v1_loadtest_proto_rawDesc = "" +
 	" \x03(\v2,.loadtest.v1.MetricCounters.StatusCodesEntryR\vstatusCodes\x1a>\n" +
 	"\x10StatusCodesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\x05R\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"\xc6\x03\n" +
+	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"\xf4\x03\n" +
 	"\fMetricsDelta\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x15\n" +
 	"\x06run_id\x18\x02 \x01(\tR\x05runId\x12/\n" +
@@ -1267,7 +1275,9 @@ const file_loadtest_v1_loadtest_proto_rawDesc = "" +
 	"\finterval_end\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\vintervalEnd\x127\n" +
 	"\bcounters\x18\a \x01(\v2\x1b.loadtest.v1.MetricCountersR\bcounters\x12M\n" +
 	"\x12histogram_encoding\x18\b \x01(\x0e2\x1e.loadtest.v1.HistogramEncodingR\x11histogramEncoding\x12+\n" +
-	"\x11latency_histogram\x18\t \x01(\fR\x10latencyHistogram\"\xbb\x02\n" +
+	"\x11latency_histogram\x18\t \x01(\fR\x10latencyHistogram\x12,\n" +
+	"\x12final_for_revision\x18\n" +
+	" \x01(\bR\x10finalForRevision\"\xbb\x02\n" +
 	"\tHeartbeat\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x1a\n" +
 	"\bsequence\x18\x02 \x01(\x04R\bsequence\x123\n" +

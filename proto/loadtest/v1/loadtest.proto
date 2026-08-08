@@ -108,6 +108,7 @@ message MetricsDelta {
   MetricCounters counters = 7;
   HistogramEncoding histogram_encoding = 8;
   bytes latency_histogram = 9;
+  bool final_for_revision = 10;
 }
 
 // Heartbeat reports liveness and the newest assignment applied by the worker.

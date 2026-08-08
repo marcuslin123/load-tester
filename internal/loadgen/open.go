@@ -22,6 +22,7 @@ type OpenOptions struct {
 	Rate        int
 	MaxInFlight int
 	RampUp      time.Duration
+	StartAt     time.Time
 }
 
 type scheduleClock interface {
@@ -48,10 +49,13 @@ func runOpen(
 		return err
 	}
 
-	started := clock.Now()
+	started := options.StartAt
+	if started.IsZero() {
+		started = clock.Now()
+	}
 	slots := make(chan struct{}, options.MaxInFlight)
 	var requests sync.WaitGroup
-	for sequence := int64(0); ; sequence++ {
+	for sequence := firstArrivalSequence(started, clock.Now(), options); ; sequence++ {
 		intended := started.Add(arrivalOffset(sequence, options))
 		if !clock.WaitUntil(ctx, intended) || ctx.Err() != nil {
 			break
@@ -67,6 +71,30 @@ func runOpen(
 	}
 	requests.Wait()
 	return nil
+}
+
+// firstArrivalSequence finds the first arrival that has not already passed,
+// preserving the original schedule when a replacement assignment starts late.
+func firstArrivalSequence(started, now time.Time, options OpenOptions) int64 {
+	elapsed := now.Sub(started)
+	if elapsed <= 0 {
+		return 0
+	}
+
+	high := int64(1)
+	for arrivalOffset(high, options) < elapsed {
+		high *= 2
+	}
+	low := int64(0)
+	for low < high {
+		middle := low + (high-low)/2
+		if arrivalOffset(middle, options) < elapsed {
+			low = middle + 1
+		} else {
+			high = middle
+		}
+	}
+	return low
 }
 
 func validateOpen(executor protocol.Protocol, sink OpenSink, options OpenOptions) error {

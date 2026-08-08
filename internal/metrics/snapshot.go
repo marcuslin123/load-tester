@@ -29,6 +29,14 @@ type Snapshot struct {
 	latencies *hdrhistogram.Histogram
 }
 
+// ObservationCount is the number of request latencies represented by the histogram.
+func (s Snapshot) ObservationCount() uint64 {
+	if s.latencies == nil {
+		return 0
+	}
+	return uint64(s.latencies.TotalCount())
+}
+
 // Percentile returns the observed latency at the requested percentile. Failed
 // requests are included because their wait time is part of the target's behavior.
 func (s Snapshot) Percentile(percentile float64) time.Duration {
@@ -43,16 +51,31 @@ func (s Snapshot) Percentile(percentile float64) time.Duration {
 func Merge(snapshots ...Snapshot) (Snapshot, error) {
 	merged := newSnapshot()
 	for _, snapshot := range snapshots {
-		merged.Requests += snapshot.Requests
-		merged.Succeeded += snapshot.Succeeded
-		merged.Failed += snapshot.Failed
-		merged.TransportErrors += snapshot.TransportErrors
-		merged.ClientErrors += snapshot.ClientErrors
-		merged.ServerErrors += snapshot.ServerErrors
-		merged.BytesRead += snapshot.BytesRead
-		merged.DroppedSamples += snapshot.DroppedSamples
-		merged.UnmetDemand += snapshot.UnmetDemand
+		counters := []struct {
+			name  string
+			value *uint64
+			add   uint64
+		}{
+			{name: "requests", value: &merged.Requests, add: snapshot.Requests},
+			{name: "succeeded", value: &merged.Succeeded, add: snapshot.Succeeded},
+			{name: "failed", value: &merged.Failed, add: snapshot.Failed},
+			{name: "transport errors", value: &merged.TransportErrors, add: snapshot.TransportErrors},
+			{name: "client errors", value: &merged.ClientErrors, add: snapshot.ClientErrors},
+			{name: "server errors", value: &merged.ServerErrors, add: snapshot.ServerErrors},
+			{name: "bytes read", value: &merged.BytesRead, add: snapshot.BytesRead},
+			{name: "dropped samples", value: &merged.DroppedSamples, add: snapshot.DroppedSamples},
+			{name: "unmet demand", value: &merged.UnmetDemand, add: snapshot.UnmetDemand},
+		}
+		for _, counter := range counters {
+			if counter.add > ^uint64(0)-*counter.value {
+				return Snapshot{}, fmt.Errorf("merge %s: uint64 overflow", counter.name)
+			}
+			*counter.value += counter.add
+		}
 		for status, count := range snapshot.StatusCodes {
+			if count > ^uint64(0)-merged.StatusCodes[status] {
+				return Snapshot{}, fmt.Errorf("merge HTTP status %d: uint64 overflow", status)
+			}
 			merged.StatusCodes[status] += count
 		}
 

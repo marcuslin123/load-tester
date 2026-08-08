@@ -242,6 +242,33 @@ effectively be load testing itself.
    **delta** upstream.
 4. The orchestrator **merges** histograms and counters additively.
 
+Distributed workers do not send preflight requests. An assignment creates one
+run controller that owns the scheduler, collector, absolute reporting clock,
+and revision transitions. Closed and open schedulers remain anchored to the
+assignment's original `starts_at`: rebalances start already-due work immediately
+and skip past open-model arrivals instead of replaying them or restarting ramp.
+
+Active workers report at one-second boundaries measured from `starts_at` and
+flush a final partial interval at the deadline. A revision change cancels and
+drains the previous scheduler, flushes a partial delta tagged with that old
+revision, and then applies the replacement without resetting the collector or
+per-run delta sequence. An explicit final-revision marker closes the old
+revision even when that flush lands exactly on a one-second boundary. Zero-load
+workers remain idle and send no metric deltas.
+
+Histogram payloads use raw HDR V2 compressed bytes. The orchestrator validates
+the worker, run, known assignment revision, interval, strict sequence, counter
+invariants, encoding, and histogram observation count before atomically merging
+a delta. Exact duplicates are idempotent; gaps, conflicting duplicates,
+malformed deltas, and missing final deltas become integrity violations rather
+than producing a trustworthy-looking partial result.
+
+At the absolute deadline, the orchestrator waits for final deltas from every
+worker with nonzero load in the latest revision. It finishes as soon as all
+arrive or after a two-second grace period, lists missing workers as integrity
+violations, evaluates the merged snapshot over the configured duration, and
+prints the same summary and exit statuses as the local CLI.
+
 Merged histograms are load-bearing here: **percentiles cannot be averaged.** The
 mean of two workers' p99 values is not the fleet p99. Merging histogram buckets
 produces a mathematically correct global percentile.

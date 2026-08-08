@@ -27,8 +27,14 @@ type assignmentCoordinator struct {
 	leadTime time.Duration
 	now      func() time.Time
 	changed  chan struct{}
+	started  chan runWindow
 
 	revision uint64
+	startsAt time.Time
+	deadline time.Time
+}
+
+type runWindow struct {
 	startsAt time.Time
 	deadline time.Time
 }
@@ -60,6 +66,7 @@ func newAssignmentCoordinator(
 		leadTime: options.LeadTime,
 		now:      now,
 		changed:  make(chan struct{}, 1),
+		started:  make(chan runWindow, 1),
 	}, nil
 }
 
@@ -94,6 +101,7 @@ func (c *assignmentCoordinator) reconcile() {
 	if c.revision == 0 {
 		c.startsAt = now.Add(c.leadTime)
 		c.deadline = c.startsAt.Add(c.config.Load.Duration)
+		c.started <- runWindow{startsAt: c.startsAt, deadline: c.deadline}
 	} else if !now.Before(c.deadline) {
 		return
 	}
@@ -109,8 +117,15 @@ func (c *assignmentCoordinator) reconcile() {
 	}
 
 	c.revision++
+	assignments := make(map[string]*loadtestv1.LoadAssignment, len(workers))
 	for _, worker := range workers {
-		assignment := c.assignmentFor(loadSlices[worker.state.ID])
+		assignments[worker.state.ID] = c.assignmentFor(loadSlices[worker.state.ID])
+	}
+	if c.server.metrics != nil {
+		c.server.metrics.RecordAssignments(c.revision, assignments)
+	}
+	for _, worker := range workers {
+		assignment := assignments[worker.state.ID]
 		if err := worker.send(&loadtestv1.OrchestratorMessage{Payload: &loadtestv1.OrchestratorMessage_Assignment{
 			Assignment: assignment,
 		}}); err != nil {

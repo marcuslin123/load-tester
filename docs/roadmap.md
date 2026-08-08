@@ -330,6 +330,19 @@ One second, pre-aggregated, is a deliberate ceiling (spec §5): at 50k RPS acros
 20 workers, per-request messages would be a million messages a second and the
 platform would be load testing itself.
 
+**Design decisions:** A dedicated worker run controller applies assignments
+without distributed preflight requests. Schedulers use the original absolute
+start so rebalances neither restart ramp nor replay missed open-model arrivals.
+One-second deltas and deadline flushes share the existing bounded stream writer;
+revision changes create partial delta boundaries without resetting collection or
+sequence numbers, and an explicit marker identifies each revision's final delta.
+Histograms travel as raw HDR V2 compressed bytes. The
+orchestrator validates each complete delta before merging, ignores exact
+duplicates, and treats sequence gaps, malformed data, conflicting duplicates,
+and missing final deltas as integrity failures. Completion waits for all latest
+nonzero workers or a two-second post-deadline grace period, then uses the local
+summary format and exit statuses.
+
 ### Piece 14 — Worker death and recovery **(Phase 2 gate)**
 
 **Goal:** Detect a dead worker, redistribute its slice, and finish the run.

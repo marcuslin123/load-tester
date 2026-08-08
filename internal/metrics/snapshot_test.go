@@ -55,6 +55,17 @@ func TestMergeAddsUnmetDemand(t *testing.T) {
 	assertCounter(t, "UnmetDemand", merged.UnmetDemand, 7)
 }
 
+func TestMergeRejectsCounterOverflow(t *testing.T) {
+	t.Parallel()
+
+	if _, err := Merge(
+		Snapshot{BytesRead: ^uint64(0)},
+		Snapshot{BytesRead: 1},
+	); err == nil {
+		t.Fatal("Merge(counter overflow) error = nil, want overflow error")
+	}
+}
+
 func collectRepeatedResults(t *testing.T, count int, result protocol.Result) Snapshot {
 	t.Helper()
 

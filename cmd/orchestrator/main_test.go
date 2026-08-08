@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/marcuslin123/load-tester/internal/report"
 )
 
 func TestParseOptionsRequiresConfigAndDefaultsAddress(t *testing.T) {
@@ -80,6 +84,53 @@ func TestLoadTestConfigRejectsInvalidYAML(t *testing.T) {
 	path := writeOrchestratorConfig(t, "name: incomplete\n")
 	if _, err := loadTestConfig(path); err == nil {
 		t.Fatal("loadTestConfig() error = nil, want validation error")
+	}
+}
+
+func TestExitCodeForSummary(t *testing.T) {
+	tests := []struct {
+		status report.Status
+		want   exitCode
+	}{
+		{status: report.StatusPass, want: exitPass},
+		{status: report.StatusFail, want: exitTestFailure},
+		{status: report.StatusInterrupted, want: exitInterrupted},
+		{status: report.Status("UNKNOWN"), want: exitSetupFailure},
+	}
+	for _, test := range tests {
+		if got := exitCodeForSummary(report.Summary{Status: test.status}); got != test.want {
+			t.Errorf("exitCodeForSummary(%s) = %d, want %d", test.status, got, test.want)
+		}
+	}
+}
+
+func TestAwaitRunCompletionReturnsInterruptedResultWhenServerStopsOnCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	results := make(chan runResult, 1)
+	results <- runResult{summary: report.Summary{Status: report.StatusInterrupted}}
+	serveErrors := make(chan error, 1)
+	serveErrors <- errors.New("listener closed")
+
+	summary, err := awaitRunCompletion(ctx, results, serveErrors, func() {})
+	if err != nil {
+		t.Fatalf("awaitRunCompletion() error = %v", err)
+	}
+	if summary.Status != report.StatusInterrupted {
+		t.Fatalf("status = %s, want %s", summary.Status, report.StatusInterrupted)
+	}
+}
+
+func TestAwaitRunCompletionDoesNotHideUnexpectedServerErrorAfterResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	results := make(chan runResult, 1)
+	results <- runResult{summary: report.Summary{Status: report.StatusPass}}
+	serveErrors := make(chan error, 1)
+	serveErrors <- errors.New("listener failed")
+
+	_, err := awaitRunCompletion(ctx, results, serveErrors, cancel)
+	if err == nil || !strings.Contains(err.Error(), "listener failed") {
+		t.Fatalf("awaitRunCompletion() error = %v, want listener failure", err)
 	}
 }
 

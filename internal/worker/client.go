@@ -206,15 +206,22 @@ func runRegistered(
 ) error {
 	outbound := make(chan *loadtestv1.WorkerMessage, outboundBufferSize)
 	errors := make(chan error, 2)
-	assignments := newAssignmentState()
+	controller, err := newRunController(ctx, workerID, outbound, runControllerOptions{})
+	if err != nil {
+		return err
+	}
+	defer controller.Close()
 	go writeMessages(ctx, stream, outbound, errors)
-	go produceHeartbeats(ctx, workerID, heartbeatInterval, dependencies.now, assignments, outbound)
-	go receiveMessages(ctx, stream, assignments, dependencies.logger, errors)
+	go produceHeartbeats(ctx, workerID, heartbeatInterval, dependencies.now, controller, outbound)
+	go receiveMessages(ctx, stream, controller, dependencies.logger, errors)
 
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case err := <-errors:
+		cancel()
+		return err
+	case err := <-controller.Errors():
 		cancel()
 		return err
 	}
@@ -245,7 +252,7 @@ func produceHeartbeats(
 	workerID string,
 	interval time.Duration,
 	now func() time.Time,
-	assignments *assignmentState,
+	controller *runController,
 	outbound chan<- *loadtestv1.WorkerMessage,
 ) {
 	ticker := time.NewTicker(interval)
@@ -255,15 +262,16 @@ func produceHeartbeats(
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			runID, revision := assignments.Status()
+			status := controller.Status()
 			message := &loadtestv1.WorkerMessage{Payload: &loadtestv1.WorkerMessage_Heartbeat{
 				Heartbeat: &loadtestv1.Heartbeat{
 					WorkerId:                  workerID,
 					Sequence:                  sequence,
 					SentAt:                    timestamppb.New(now()),
-					State:                     loadtestv1.WorkerState_WORKER_STATE_IDLE,
-					ActiveRunId:               runID,
-					AppliedAssignmentRevision: revision,
+					State:                     status.State,
+					ActiveRunId:               status.RunID,
+					AppliedAssignmentRevision: status.Revision,
+					InFlightRequests:          status.InFlight,
 				},
 			}}
 			select {
@@ -278,7 +286,7 @@ func produceHeartbeats(
 func receiveMessages(
 	ctx context.Context,
 	stream loadtestv1.WorkerControl_ConnectClient,
-	assignments *assignmentState,
+	controller *runController,
 	logger *log.Logger,
 	errors chan<- error,
 ) {
@@ -293,8 +301,8 @@ func receiveMessages(
 			reportStreamError(ctx, errors, status.Error(codes.FailedPrecondition, "only load assignments are accepted after registration"))
 			return
 		}
-		if err := assignments.Apply(assignment); err != nil {
-			reportStreamError(ctx, errors, err)
+		if err := controller.Apply(assignment); err != nil {
+			reportStreamError(ctx, errors, status.Error(codes.FailedPrecondition, err.Error()))
 			return
 		}
 		logger.Printf("assignment applied: run_id=%s revision=%d", assignment.GetRunId(), assignment.GetRevision())

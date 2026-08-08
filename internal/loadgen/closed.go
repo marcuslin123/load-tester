@@ -19,6 +19,7 @@ type ResultSink interface {
 type ClosedOptions struct {
 	VirtualUsers int
 	RampUp       time.Duration
+	StartAt      time.Time
 }
 
 // RunClosed keeps one sequential request loop active per virtual user until the
@@ -38,7 +39,10 @@ func RunClosed(ctx context.Context, executor protocol.Protocol, sink ResultSink,
 	}
 
 	var users sync.WaitGroup
-	rampStarted := time.Now()
+	rampStarted := options.StartAt
+	if rampStarted.IsZero() {
+		rampStarted = time.Now()
+	}
 	for user := range options.VirtualUsers {
 		delay := rampDelay(user, options.VirtualUsers, options.RampUp)
 		if !waitForRamp(ctx, time.Until(rampStarted.Add(delay))) {

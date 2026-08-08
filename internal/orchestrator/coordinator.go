@@ -5,10 +5,13 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	loadtestv1 "github.com/marcuslin123/load-tester/gen/loadtest/v1"
 	"github.com/marcuslin123/load-tester/internal/config"
+	"github.com/marcuslin123/load-tester/internal/loadgen"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -22,6 +25,7 @@ type AssignmentOptions struct {
 
 type assignmentCoordinator struct {
 	server   *Server
+	ctx      context.Context
 	config   config.Config
 	runID    string
 	leadTime time.Duration
@@ -32,6 +36,22 @@ type assignmentCoordinator struct {
 	revision uint64
 	startsAt time.Time
 	deadline time.Time
+
+	failureMu       sync.Mutex
+	pendingFailures map[string]workerFailure
+	delivered       map[string]*loadtestv1.LoadAssignment
+	recovery        map[string]workerRecovery
+}
+
+type workerFailure struct {
+	workerID string
+	reason   string
+	detected time.Time
+}
+
+type workerRecovery struct {
+	detected time.Time
+	load     *loadtestv1.LoadSlice
 }
 
 type runWindow struct {
@@ -60,13 +80,17 @@ func newAssignmentCoordinator(
 		return nil, errors.New("load duration must be greater than zero")
 	}
 	return &assignmentCoordinator{
-		server:   server,
-		config:   options.Config,
-		runID:    strings.TrimSpace(options.RunID),
-		leadTime: options.LeadTime,
-		now:      now,
-		changed:  make(chan struct{}, 1),
-		started:  make(chan runWindow, 1),
+		server:          server,
+		ctx:             options.Context,
+		config:          options.Config,
+		runID:           strings.TrimSpace(options.RunID),
+		leadTime:        options.LeadTime,
+		now:             now,
+		changed:         make(chan struct{}, 1),
+		started:         make(chan runWindow, 1),
+		pendingFailures: make(map[string]workerFailure),
+		delivered:       make(map[string]*loadtestv1.LoadAssignment),
+		recovery:        make(map[string]workerRecovery),
 	}, nil
 }
 
@@ -77,6 +101,21 @@ func (c *assignmentCoordinator) membershipChanged() {
 	case c.changed <- struct{}{}:
 	default:
 	}
+}
+
+// workerFailed preserves failure details until the coordinator can reconcile
+// them with its ordered assignment history.
+func (c *assignmentCoordinator) workerFailed(workerID, reason string, detected time.Time) {
+	c.failureMu.Lock()
+	if _, exists := c.pendingFailures[workerID]; !exists {
+		c.pendingFailures[workerID] = workerFailure{
+			workerID: workerID,
+			reason:   reason,
+			detected: detected,
+		}
+	}
+	c.failureMu.Unlock()
+	c.membershipChanged()
 }
 
 func (c *assignmentCoordinator) run(ctx context.Context) {
@@ -94,7 +133,8 @@ func (c *assignmentCoordinator) run(ctx context.Context) {
 // runs only on the coordinator goroutine, which keeps run timing and revisions ordered.
 func (c *assignmentCoordinator) reconcile() {
 	workers := c.server.activeSessions()
-	if len(workers) < c.config.Fleet.MinWorkers {
+	c.processFailures()
+	if c.revision == 0 && len(workers) < c.config.Fleet.MinWorkers {
 		return
 	}
 	now := c.now()
@@ -110,10 +150,14 @@ func (c *assignmentCoordinator) reconcile() {
 	for index, worker := range workers {
 		workerIDs[index] = worker.state.ID
 	}
-	loadSlices, err := splitLoad(c.config.Load, workerIDs)
-	if err != nil {
-		c.server.logger.Printf("compute assignments: run_id=%s error=%v", c.runID, err)
-		return
+	loadSlices := make(map[string]*loadtestv1.LoadSlice, len(workerIDs))
+	if len(workerIDs) > 0 {
+		var err error
+		loadSlices, err = splitLoad(c.config.Load, workerIDs)
+		if err != nil {
+			c.server.logger.Printf("compute assignments: run_id=%s error=%v", c.runID, err)
+			return
+		}
 	}
 
 	c.revision++
@@ -124,6 +168,7 @@ func (c *assignmentCoordinator) reconcile() {
 	if c.server.metrics != nil {
 		c.server.metrics.RecordAssignments(c.revision, assignments)
 	}
+	deliveredLoads := make([]*loadtestv1.LoadSlice, 0, len(workers))
 	for _, worker := range workers {
 		assignment := assignments[worker.state.ID]
 		if err := worker.send(&loadtestv1.OrchestratorMessage{Payload: &loadtestv1.OrchestratorMessage_Assignment{
@@ -136,8 +181,92 @@ func (c *assignmentCoordinator) reconcile() {
 				c.revision,
 				err,
 			)
-			c.server.removeSession(worker.state.ID, worker)
+			c.server.removeSessionWithReason(worker.state.ID, worker, "assignment delivery failed")
+			continue
 		}
+		c.delivered[worker.state.ID] = proto.Clone(assignment).(*loadtestv1.LoadAssignment)
+		deliveredLoads = append(deliveredLoads, assignment.GetLoad())
+	}
+	if c.restoresConfiguredCapacity(deliveredLoads) {
+		c.recordRecoveredDemand(c.now())
+	}
+}
+
+// restoresConfiguredCapacity prevents a partial assignment revision from
+// closing recovery windows before the fleet can generate the requested load.
+func (c *assignmentCoordinator) restoresConfiguredCapacity(loads []*loadtestv1.LoadSlice) bool {
+	var virtualUsers uint64
+	var rate uint64
+	var maxInFlight uint64
+	for _, load := range loads {
+		virtualUsers += load.GetVirtualUsers()
+		rate += load.GetRate()
+		maxInFlight += load.GetMaxInFlight()
+	}
+	switch c.config.Load.Model {
+	case config.LoadConstantVUs:
+		return virtualUsers >= uint64(c.config.Load.VirtualUsers)
+	case config.LoadConstantRate:
+		return rate >= uint64(c.config.Load.Rate) &&
+			maxInFlight >= uint64(c.config.Load.MaxInFlight)
+	default:
+		return false
+	}
+}
+
+func (c *assignmentCoordinator) processFailures() {
+	c.failureMu.Lock()
+	failures := c.pendingFailures
+	c.pendingFailures = make(map[string]workerFailure)
+	c.failureMu.Unlock()
+
+	for workerID, failure := range failures {
+		assignment := c.delivered[workerID]
+		delete(c.delivered, workerID)
+		if assignment == nil || c.revision == 0 || c.ctx.Err() != nil ||
+			!failure.detected.Before(c.deadline) || !isActiveSlice(assignment.GetLoad()) {
+			continue
+		}
+		if c.server.metrics.RecordWorkerFailure(workerID, failure.reason) &&
+			assignment.GetLoad().GetModel() == loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE {
+			c.recovery[workerID] = workerRecovery{
+				detected: failure.detected,
+				load:     proto.Clone(assignment.GetLoad()).(*loadtestv1.LoadSlice),
+			}
+			c.server.logger.Printf(
+				"worker recovery pending: worker_id=%s run_id=%s rate=%d detected_at=%s",
+				workerID,
+				c.runID,
+				assignment.GetLoad().GetRate(),
+				failure.detected.Format(time.RFC3339Nano),
+			)
+		}
+	}
+}
+
+// recordRecoveredDemand adds only arrivals whose absolute deadlines passed
+// before a successful replacement assignment restored open-model capacity.
+func (c *assignmentCoordinator) recordRecoveredDemand(restored time.Time) {
+	for workerID, recovery := range c.recovery {
+		count := loadgen.ScheduledArrivalsBetween(
+			c.startsAt,
+			recovery.detected,
+			restored,
+			int(recovery.load.GetRate()),
+			recovery.load.GetRampUp().AsDuration(),
+		)
+		if err := c.server.metrics.AddRecoveryUnmetDemand(workerID, count); err != nil {
+			c.server.logger.Printf("record recovery demand: worker_id=%s run_id=%s error=%v", workerID, c.runID, err)
+			continue
+		}
+		c.server.logger.Printf(
+			"worker recovery accounted: worker_id=%s run_id=%s unmet_demand=%d restored_at=%s",
+			workerID,
+			c.runID,
+			count,
+			restored.Format(time.RFC3339Nano),
+		)
+		delete(c.recovery, workerID)
 	}
 }
 

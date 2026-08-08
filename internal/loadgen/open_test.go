@@ -138,6 +138,62 @@ func TestRunOpenSkipsArrivalsBeforeAbsoluteStartPosition(t *testing.T) {
 	}
 }
 
+func TestScheduledArrivalsBetweenUsesAbsoluteSchedule(t *testing.T) {
+	started := time.Date(2026, time.August, 8, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		from   time.Time
+		to     time.Time
+		rate   int
+		rampUp time.Duration
+		want   uint64
+	}{
+		{
+			name: "constant rate half-open interval",
+			from: started.Add(250 * time.Millisecond),
+			to:   started.Add(1250 * time.Millisecond),
+			rate: 2,
+			want: 2,
+		},
+		{
+			name:   "during ramp",
+			from:   started,
+			to:     started.Add(2 * time.Second),
+			rate:   4,
+			rampUp: 2 * time.Second,
+			want:   3,
+		},
+		{
+			name:   "after ramp",
+			from:   started.Add(2 * time.Second),
+			to:     started.Add(3 * time.Second),
+			rate:   4,
+			rampUp: 2 * time.Second,
+			want:   4,
+		},
+		{
+			name: "clips before run start",
+			from: started.Add(-time.Second),
+			to:   started.Add(500 * time.Millisecond),
+			rate: 2,
+			want: 1,
+		},
+		{
+			name: "empty reversed interval",
+			from: started.Add(time.Second),
+			to:   started,
+			rate: 2,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ScheduledArrivalsBetween(started, test.from, test.to, test.rate, test.rampUp); got != test.want {
+				t.Fatalf("ScheduledArrivalsBetween() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 func TestRunOpenRequestMeasuresFromIntendedArrival(t *testing.T) {
 	t.Parallel()
 

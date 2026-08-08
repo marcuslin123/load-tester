@@ -5,6 +5,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -90,6 +92,50 @@ func TestRunReportsAppliedAssignmentInHeartbeat(t *testing.T) {
 				if heartbeat.GetActiveRunId() == "run-12" && heartbeat.GetAppliedAssignmentRevision() == 2 {
 					if heartbeat.GetState() != loadtestv1.WorkerState_WORKER_STATE_IDLE {
 						return status.Errorf(codes.InvalidArgument, "state = %v, want IDLE", heartbeat.GetState())
+					}
+					cancel()
+					return nil
+				}
+			}
+		},
+	}
+	dependencies := startWorkerTestServer(t, server)
+
+	if err := run(ctx, validConfig(), Options{}, dependencies); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+}
+
+func TestRunUsesNegotiatedMetricSequence(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	server := &testControlServer{
+		handle: func(stream grpc.BidiStreamingServer[loadtestv1.WorkerMessage, loadtestv1.OrchestratorMessage], _ int) error {
+			if _, err := stream.Recv(); err != nil {
+				return err
+			}
+			ack := registrationAck("worker-1", time.Hour)
+			ack.GetRegistrationAck().NextMetricsSequence = 42
+			if err := stream.Send(ack); err != nil {
+				return err
+			}
+			startsAt := time.Now().Add(5 * time.Millisecond)
+			if err := stream.Send(&loadtestv1.OrchestratorMessage{Payload: &loadtestv1.OrchestratorMessage_Assignment{
+				Assignment: controllerAssignment(target.URL, "run-14", 1, 1, startsAt, startsAt.Add(15*time.Millisecond)),
+			}}); err != nil {
+				return err
+			}
+			for {
+				message, err := stream.Recv()
+				if err != nil {
+					return err
+				}
+				if delta := message.GetMetrics(); delta != nil {
+					if delta.GetSequence() != 42 {
+						return status.Errorf(codes.InvalidArgument, "metric sequence = %d, want 42", delta.GetSequence())
 					}
 					cancel()
 					return nil
@@ -281,8 +327,9 @@ func startWorkerTestServer(t *testing.T, service loadtestv1.WorkerControlServer)
 func registrationAck(workerID string, heartbeatInterval time.Duration) *loadtestv1.OrchestratorMessage {
 	return &loadtestv1.OrchestratorMessage{Payload: &loadtestv1.OrchestratorMessage_RegistrationAck{
 		RegistrationAck: &loadtestv1.RegistrationAck{
-			WorkerId:          workerID,
-			HeartbeatInterval: durationpb.New(heartbeatInterval),
+			WorkerId:            workerID,
+			HeartbeatInterval:   durationpb.New(heartbeatInterval),
+			NextMetricsSequence: 1,
 		},
 	}}
 }

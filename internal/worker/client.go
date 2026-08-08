@@ -165,9 +165,13 @@ func runSession(
 	if heartbeatInterval <= 0 {
 		return false, status.Error(codes.FailedPrecondition, "heartbeat interval must be greater than zero")
 	}
+	nextMetricsSequence := ack.GetNextMetricsSequence()
+	if nextMetricsSequence == 0 {
+		return false, status.Error(codes.FailedPrecondition, "next metrics sequence must be greater than zero")
+	}
 	dependencies.logger.Printf("worker registered: id=%s heartbeat_interval=%s", config.WorkerID, heartbeatInterval)
 
-	err = runRegistered(sessionCtx, cancel, stream, config.WorkerID, heartbeatInterval, dependencies)
+	err = runRegistered(sessionCtx, cancel, stream, config.WorkerID, heartbeatInterval, nextMetricsSequence, dependencies)
 	return true, err
 }
 
@@ -202,11 +206,14 @@ func runRegistered(
 	stream loadtestv1.WorkerControl_ConnectClient,
 	workerID string,
 	heartbeatInterval time.Duration,
+	nextMetricsSequence uint64,
 	dependencies runtimeDependencies,
 ) error {
 	outbound := make(chan *loadtestv1.WorkerMessage, outboundBufferSize)
 	errors := make(chan error, 2)
-	controller, err := newRunController(ctx, workerID, outbound, runControllerOptions{})
+	controller, err := newRunController(ctx, workerID, outbound, runControllerOptions{
+		InitialSequence: nextMetricsSequence,
+	})
 	if err != nil {
 		return err
 	}

@@ -49,6 +49,7 @@ message Registration {
 message RegistrationAck {
   string worker_id = 1;
   google.protobuf.Duration heartbeat_interval = 2;
+  uint64 next_metrics_sequence = 3;
 }
 
 message HttpTarget {

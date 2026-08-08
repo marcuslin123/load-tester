@@ -361,6 +361,20 @@ This is where the choice of one bidirectional stream pays off: metric push,
 command push, and liveness all ride the same connection, so a broken stream *is*
 the death notification and no separate health check is needed (spec §11).
 
+**Design decisions:** `min_workers` gates startup only; after the run begins, the
+coordinator rebalances across every healthy worker and records an empty revision
+if none remain. Each stream owns a liveness timer equal to three heartbeat
+intervals, reset by any valid worker message. Broken streams, liveness timeouts,
+and assignment-send failures remove the session and coalesce into a fresh
+membership reconciliation. Complete deltas remain merged, but loss of an active
+worker's unreported interval is an integrity failure; zero-load departures do
+not invalidate the run. Open-model recovery records lower-bound unmet demand
+from the absolute schedule between failure detection and successful replacement
+assignment dispatch. Reconnecting stable worker IDs receive the next metric
+sequence and newest revision. This piece accepts available or manually started
+replacements; automatic Docker and Kubernetes provisioning remains in later
+fleet-manager and autoscaler pieces.
+
 ---
 
 ## Phase 3 — Containers and observability

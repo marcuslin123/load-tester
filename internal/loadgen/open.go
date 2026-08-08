@@ -97,6 +97,27 @@ func firstArrivalSequence(started, now time.Time, options OpenOptions) int64 {
 	return low
 }
 
+// ScheduledArrivalsBetween counts absolute open-model deadlines in [from, to),
+// including the same ramp curve used by the live scheduler.
+func ScheduledArrivalsBetween(
+	started time.Time,
+	from time.Time,
+	to time.Time,
+	rate int,
+	rampUp time.Duration,
+) uint64 {
+	if started.IsZero() || !to.After(from) || rate <= 0 || rampUp < 0 {
+		return 0
+	}
+	options := OpenOptions{Rate: rate, RampUp: rampUp}
+	first := firstArrivalSequence(started, from, options)
+	after := firstArrivalSequence(started, to, options)
+	if after <= first {
+		return 0
+	}
+	return uint64(after - first)
+}
+
 func validateOpen(executor protocol.Protocol, sink OpenSink, options OpenOptions) error {
 	if options.Rate <= 0 {
 		return errors.New("rate must be greater than zero")

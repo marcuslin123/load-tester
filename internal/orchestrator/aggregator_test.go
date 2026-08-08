@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,6 +78,37 @@ func TestMetricsAggregatorIgnoresExactDuplicate(t *testing.T) {
 	}
 	if got := aggregator.Snapshot().Requests; got != 1 {
 		t.Fatalf("requests after duplicate = %d, want 1", got)
+	}
+}
+
+func TestMetricsAggregatorReturnsNextSequenceForStableWorker(t *testing.T) {
+	started := time.Now()
+	deadline := started.Add(time.Second)
+	aggregator := newMetricsAggregator("run-14")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-14", 1, 1, started, deadline),
+	})
+	delta := metricsDeltaForTest(t, "worker-a", 1, 1, started, deadline, []protocol.Result{
+		{Latency: 10 * time.Millisecond, StatusCode: 200},
+	}, true)
+	delta.RunId = "run-14"
+	if err := aggregator.Accept("worker-a", delta); err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+
+	next, err := aggregator.NextSequence("worker-a")
+	if err != nil {
+		t.Fatalf("NextSequence(worker-a) error = %v", err)
+	}
+	if next != 2 {
+		t.Fatalf("NextSequence(worker-a) = %d, want 2", next)
+	}
+	unknown, err := aggregator.NextSequence("worker-new")
+	if err != nil {
+		t.Fatalf("NextSequence(worker-new) error = %v", err)
+	}
+	if unknown != 1 {
+		t.Fatalf("NextSequence(worker-new) = %d, want 1", unknown)
 	}
 }
 
@@ -240,6 +272,60 @@ func TestMetricsAggregatorClosesReplacedRevisionAtExactBoundary(t *testing.T) {
 
 	if err := aggregator.Accept("worker-a", extra); err == nil {
 		t.Fatal("Accept(delta after final revision marker) error = nil, want integrity error")
+	}
+}
+
+func TestMetricsAggregatorRecordsOnlyActiveWorkerFailure(t *testing.T) {
+	started := time.Now()
+	deadline := started.Add(time.Second)
+	aggregator := newMetricsAggregator("run-14")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-active": metricsAssignment("run-14", 1, 1, started, deadline),
+		"worker-idle":   metricsAssignment("run-14", 1, 0, started, deadline),
+	})
+	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{})
+
+	if active := aggregator.RecordWorkerFailure("worker-active", "heartbeat timeout"); !active {
+		t.Fatal("RecordWorkerFailure(active) = false, want true")
+	}
+	if active := aggregator.RecordWorkerFailure("worker-idle", "stream closed"); active {
+		t.Fatal("RecordWorkerFailure(idle) = true, want false")
+	}
+	violations := aggregator.Violations()
+	if len(violations) != 1 || !strings.Contains(violations[0], "worker-active") || !strings.Contains(violations[0], "heartbeat timeout") {
+		t.Fatalf("violations = %v, want one named active-worker failure", violations)
+	}
+}
+
+func TestMetricsAggregatorAddsRecoveryUnmetDemandWithoutLosingHistory(t *testing.T) {
+	started := time.Now()
+	deadline := started.Add(time.Second)
+	aggregator := newMetricsAggregator("run-14")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-14", 1, 1, started, deadline),
+	})
+	delta := metricsDeltaForTest(t, "worker-a", 1, 1, started, deadline, []protocol.Result{
+		{Latency: 10 * time.Millisecond, StatusCode: 200},
+	}, true)
+	delta.RunId = "run-14"
+	if err := aggregator.Accept("worker-a", delta); err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if err := aggregator.AddRecoveryUnmetDemand("worker-a", 17); err != nil {
+		t.Fatalf("AddRecoveryUnmetDemand() error = %v", err)
+	}
+
+	fleet := aggregator.Snapshot()
+	worker := aggregator.WorkerSnapshots()["worker-a"]
+	if fleet.Requests != 1 || worker.Requests != 1 {
+		t.Fatalf("request history = (fleet=%d worker=%d), want 1 each", fleet.Requests, worker.Requests)
+	}
+	if fleet.UnmetDemand != 17 || worker.UnmetDemand != 17 {
+		t.Fatalf("unmet demand = (fleet=%d worker=%d), want 17 each", fleet.UnmetDemand, worker.UnmetDemand)
+	}
+	next, err := aggregator.NextSequence("worker-a")
+	if err != nil || next != 2 {
+		t.Fatalf("NextSequence() = (%d, %v), want (2, nil)", next, err)
 	}
 }
 

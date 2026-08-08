@@ -350,8 +350,8 @@ Prometheus and Grafana run as containers in the same Compose file, so
 
 | Failure | Handling |
 |---|---|
-| Worker dies mid-test | Stream breaks → orchestrator marks it dead, redistributes its slice, asks Fleet Manager for a replacement. Last-reported metrics are retained. |
-| Worker hangs (no heartbeat) | 10-second heartbeat timeout → treated as dead. |
+| Worker dies mid-test | Stream breaks -> orchestrator retains complete deltas, records an integrity failure, and redistributes the load immediately. Later fleet drivers may provision a replacement. |
+| Worker hangs (no activity) | Three missed heartbeat intervals -> close the stream and use the same recovery path as a broken connection. |
 | Target unreachable at start | Pre-flight single request; abort with a clear error rather than reporting a 100% error rate. |
 | Scale-up fails (quota/capacity) | Log the failure, continue at current fleet size, and record that target load was unmet. Never silently report as if it succeeded. |
 | Orchestrator dies | Test is lost. Accepted for Layer 1 — see §11. |
@@ -501,6 +501,33 @@ Joining workers trigger rebalances, but assignment delivery failures and worker
 departures do not redistribute load until Piece 14 adds failure detection and
 recovery. Failed sends remove the affected active session, and workers joining
 after the original deadline remain connected but idle.
+
+Piece 14 makes `min_workers` a startup gate rather than a permanent quorum. Once
+the run starts, a broken stream, failed assignment send, or three intervals with
+no valid worker message removes that session and triggers a replacement revision
+across every healthy worker, even when the fleet has fallen below the configured
+minimum. Any valid heartbeat or metric delta proves liveness; malformed traffic
+does not extend the deadline. Closely spaced
+departures are coalesced before the coordinator reads a fresh membership
+snapshot. An empty revision keeps an all-workers-dead run open for replacements
+until the original deadline.
+
+Complete metric deltas accepted before a failure remain in the fleet aggregate,
+but a nonzero-load worker's unreported partial interval is never reconstructed.
+Its loss is an integrity violation, while a zero-load worker departure is only a
+membership event. For open load, the orchestrator records a defensible lower
+bound on unmet demand: the additional absolute-schedule arrivals that could not
+be assigned between failure detection and successful replacement-assignment
+dispatch. Closed load has no prescribed arrival rate, but still fails integrity
+when an active worker dies.
+
+A reconnecting process keeps its stable worker ID. Registration returns the next
+expected metric sequence so the fresh collector cannot conflict with previously
+accepted deltas; the worker then receives the newest assignment revision. The
+failure violation remains because the old collector's partial interval was lost.
+Piece 14 redistributes to available and manually started workers only. Docker and
+Kubernetes replacement provisioning remains behind the Fleet Manager introduced
+in Pieces 16 and 20, with automated capacity recovery added by Piece 19.
 
 ### Target protocol — HTTP in Layer 1, gRPC in Week 5
 

@@ -24,6 +24,7 @@ const (
 type runControllerOptions struct {
 	ReportingInterval time.Duration
 	MetricsBufferSize int
+	InitialSequence   uint64
 	Now               func() time.Time
 	StopScheduler     func(context.CancelFunc, <-chan error)
 }
@@ -81,6 +82,9 @@ func newRunController(
 	}
 	if options.MetricsBufferSize == 0 {
 		options.MetricsBufferSize = defaultMetricsBufferSize
+	}
+	if options.InitialSequence == 0 {
+		options.InitialSequence = 1
 	}
 	if options.Now == nil {
 		options.Now = time.Now
@@ -162,7 +166,7 @@ func (c *runController) run() {
 		schedulerCancel context.CancelFunc
 		schedulerDone   <-chan error
 		intervalStart   time.Time
-		sequence        uint64
+		sequence        = c.options.InitialSequence - 1
 		timer           *time.Timer
 		timerC          <-chan time.Time
 		timerAt         time.Time

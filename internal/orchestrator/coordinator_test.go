@@ -12,6 +12,7 @@ import (
 
 	loadtestv1 "github.com/marcuslin123/load-tester/gen/loadtest/v1"
 	"github.com/marcuslin123/load-tester/internal/config"
+	"github.com/marcuslin123/load-tester/internal/loadgen"
 	"google.golang.org/grpc/metadata"
 )
 
@@ -85,6 +86,162 @@ func TestCoordinatorRebalancesJoinWithoutExtendingRunWindow(t *testing.T) {
 	assertAssignment(t, revisionTwoThird, "test-run", 2, 33, initial.Add(time.Second), initial.Add(31*time.Second))
 }
 
+func TestCoordinatorRebalancesDepartureBelowMinimumWorkers(t *testing.T) {
+	initial := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	var unixNanos atomic.Int64
+	unixNanos.Store(initial.UnixNano())
+	now := func() time.Time { return time.Unix(0, unixNanos.Load()).UTC() }
+	server, client := startAssignmentServer(t, assignmentTestConfig(2), now)
+
+	first := registerAssignmentWorker(t, client, "worker-a")
+	second := registerAssignmentWorker(t, client, "worker-b")
+	receiveAssignment(t, first)
+	receiveAssignment(t, second)
+
+	unixNanos.Store(initial.Add(2 * time.Second).UnixNano())
+	if err := second.CloseSend(); err != nil {
+		t.Fatalf("CloseSend(worker-b) error = %v", err)
+	}
+
+	rebalanced := receiveAssignment(t, first)
+	assertAssignment(t, rebalanced, "test-run", 2, 100, initial.Add(time.Second), initial.Add(31*time.Second))
+	if violations := server.metrics.Violations(); !containsViolation(violations, "worker-b failed") {
+		t.Fatalf("violations = %v, want active worker-b failure", violations)
+	}
+}
+
+func TestCoordinatorDoesNotFailRunWhenZeroLoadWorkerLeaves(t *testing.T) {
+	initial := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	var unixNanos atomic.Int64
+	unixNanos.Store(initial.UnixNano())
+	now := func() time.Time { return time.Unix(0, unixNanos.Load()).UTC() }
+	cfg := assignmentTestConfig(2)
+	cfg.Load.Model = config.LoadConstantRate
+	cfg.Load.VirtualUsers = 0
+	cfg.Load.Rate = 1
+	cfg.Load.MaxInFlight = 1
+	server, client := startAssignmentServer(t, cfg, now)
+
+	active := registerAssignmentWorker(t, client, "worker-a")
+	idle := registerAssignmentWorker(t, client, "worker-b")
+	if got := receiveAssignment(t, active).GetLoad().GetRate(); got != 1 {
+		t.Fatalf("worker-a rate = %d, want 1", got)
+	}
+	if got := receiveAssignment(t, idle).GetLoad().GetRate(); got != 0 {
+		t.Fatalf("worker-b rate = %d, want 0", got)
+	}
+
+	unixNanos.Store(initial.Add(2 * time.Second).UnixNano())
+	if err := idle.CloseSend(); err != nil {
+		t.Fatalf("CloseSend(worker-b) error = %v", err)
+	}
+	if got := receiveAssignment(t, active).GetLoad().GetRate(); got != 1 {
+		t.Fatalf("rebalanced worker-a rate = %d, want 1", got)
+	}
+	if violations := server.metrics.Violations(); containsViolation(violations, "worker-b failed") {
+		t.Fatalf("violations = %v, do not want idle worker-b failure", violations)
+	}
+}
+
+func TestCoordinatorKeepsRunOpenForReplacementAfterFleetLoss(t *testing.T) {
+	initial := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	var unixNanos atomic.Int64
+	unixNanos.Store(initial.UnixNano())
+	now := func() time.Time { return time.Unix(0, unixNanos.Load()).UTC() }
+	cfg := assignmentTestConfig(2)
+	cfg.Load.Model = config.LoadConstantRate
+	cfg.Load.VirtualUsers = 0
+	cfg.Load.Rate = 10
+	cfg.Load.MaxInFlight = 10
+	var logs bytes.Buffer
+	server, client := startTestServerWithOptions(t, Options{
+		HeartbeatInterval: time.Second,
+		Logger:            log.New(&logs, "", 0),
+		Assignment: &AssignmentOptions{
+			Config:   cfg,
+			RunID:    "test-run",
+			LeadTime: time.Second,
+		},
+	}, serverDependencies{now: now})
+
+	first := registerAssignmentWorker(t, client, "worker-a")
+	second := registerAssignmentWorker(t, client, "worker-b")
+	receiveAssignment(t, first)
+	receiveAssignment(t, second)
+
+	failureTime := initial.Add(2 * time.Second)
+	unixNanos.Store(failureTime.UnixNano())
+	if err := first.CloseSend(); err != nil {
+		t.Fatalf("CloseSend(worker-a) error = %v", err)
+	}
+	if err := second.CloseSend(); err != nil {
+		t.Fatalf("CloseSend(worker-b) error = %v", err)
+	}
+	waitForEmptyAssignmentRevision(t, server)
+
+	recoveryTime := initial.Add(4 * time.Second)
+	unixNanos.Store(recoveryTime.UnixNano())
+	replacement := registerAssignmentWorker(t, client, "worker-c")
+	recovered := receiveAssignment(t, replacement)
+	if got := recovered.GetLoad().GetRate(); got != 10 {
+		t.Fatalf("replacement rate = %d, want 10", got)
+	}
+	if got := recovered.GetStartsAt().AsTime(); !got.Equal(initial.Add(time.Second)) {
+		t.Fatalf("replacement starts at = %v, want original start", got)
+	}
+	if got := recovered.GetDeadline().AsTime(); !got.Equal(initial.Add(31 * time.Second)) {
+		t.Fatalf("replacement deadline = %v, want original deadline", got)
+	}
+
+	wantUnmet := loadgen.ScheduledArrivalsBetween(initial.Add(time.Second), failureTime, recoveryTime, 5, 0) * 2
+	if got := waitForUnmetDemand(server, wantUnmet); got != wantUnmet {
+		t.Fatalf(
+			"recovery unmet demand = %d, want %d; workers=%+v violations=%v logs=%s",
+			got,
+			wantUnmet,
+			server.metrics.WorkerSnapshots(),
+			server.metrics.Violations(),
+			logs.String(),
+		)
+	}
+}
+
+func waitForUnmetDemand(server *Server, want uint64) uint64 {
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		got := server.metrics.Snapshot().UnmetDemand
+		if got >= want {
+			return got
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return server.metrics.Snapshot().UnmetDemand
+}
+
+func TestCoordinatorDoesNotFailRunForIntentionalCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	server, client := startTestServerWithOptions(t, Options{
+		HeartbeatInterval: time.Second,
+		Assignment: &AssignmentOptions{
+			Context:  ctx,
+			Config:   assignmentTestConfig(1),
+			RunID:    "test-run",
+			LeadTime: time.Second,
+		},
+	}, serverDependencies{now: time.Now})
+	worker := registerAssignmentWorker(t, client, "worker-cancelled")
+	receiveAssignment(t, worker)
+
+	cancel()
+	if err := worker.CloseSend(); err != nil {
+		t.Fatalf("CloseSend(worker-cancelled) error = %v", err)
+	}
+	waitForNoWorkers(t, server)
+	if violations := server.metrics.Violations(); containsViolation(violations, "worker-cancelled failed") {
+		t.Fatalf("violations = %v, do not want intentional cancellation failure", violations)
+	}
+}
+
 func TestCoordinatorLeavesWorkersJoiningAfterDeadlineIdle(t *testing.T) {
 	initial := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
 	var unixNanos atomic.Int64
@@ -140,6 +297,32 @@ func TestCoordinatorRemovesSessionWhenAssignmentDeliveryFails(t *testing.T) {
 	}
 	if !bytes.Contains(logs.Bytes(), []byte("assignment delivery failed")) {
 		t.Fatalf("logs = %q, want assignment delivery failure", logs.String())
+	}
+}
+
+func TestCoordinatorRequiresCompleteOpenCapacityForRecovery(t *testing.T) {
+	cfg := assignmentTestConfig(1)
+	cfg.Load.Model = config.LoadConstantRate
+	cfg.Load.VirtualUsers = 0
+	cfg.Load.Rate = 10
+	cfg.Load.MaxInFlight = 10
+	coordinator := &assignmentCoordinator{config: cfg}
+
+	partial := []*loadtestv1.LoadSlice{{
+		Model:       loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE,
+		Rate:        5,
+		MaxInFlight: 5,
+	}}
+	if coordinator.restoresConfiguredCapacity(partial) {
+		t.Fatal("partial capacity restored recovery, want pending recovery")
+	}
+	complete := append(partial, &loadtestv1.LoadSlice{
+		Model:       loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE,
+		Rate:        5,
+		MaxInFlight: 5,
+	})
+	if !coordinator.restoresConfiguredCapacity(complete) {
+		t.Fatal("complete capacity did not restore recovery")
 	}
 }
 
@@ -229,6 +412,21 @@ func receiveAsync(stream loadtestv1.WorkerControl_ConnectClient) <-chan assignme
 		result <- assignmentReceiveResult{message: message, err: err}
 	}()
 	return result
+}
+
+func waitForEmptyAssignmentRevision(t *testing.T, server *Server) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		server.metrics.mu.Lock()
+		empty := server.assignments.revision > 1 && len(server.metrics.latest) == 0
+		server.metrics.mu.Unlock()
+		if empty {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for empty assignment revision")
 }
 
 func assertAssignment(

@@ -19,6 +19,8 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 )
 
+var errSessionClosed = errors.New("worker session is closed")
+
 // Options configures registration acknowledgments and server diagnostics.
 type Options struct {
 	HeartbeatInterval time.Duration
@@ -47,13 +49,31 @@ type WorkerSnapshot struct {
 type session struct {
 	stream grpc.BidiStreamingServer[loadtestv1.WorkerMessage, loadtestv1.OrchestratorMessage]
 	sendMu sync.Mutex
+	close  sync.Once
+	closed chan struct{}
 	state  WorkerSnapshot
 }
 
 func (s *session) send(message *loadtestv1.OrchestratorMessage) error {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+	select {
+	case <-s.closed:
+		return errSessionClosed
+	default:
+	}
 	return s.stream.Send(message)
+}
+
+func (s *session) stop() {
+	if s.closed != nil {
+		s.close.Do(func() { close(s.closed) })
+	}
+}
+
+type workerReceiveResult struct {
+	message *loadtestv1.WorkerMessage
+	err     error
 }
 
 // Server implements the worker control stream and owns the active session registry.
@@ -122,9 +142,17 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[loadtestv1.WorkerMessag
 	if workerID == "" {
 		return status.Error(codes.InvalidArgument, "worker ID is required")
 	}
+	nextMetricsSequence := uint64(1)
+	if s.metrics != nil {
+		nextMetricsSequence, err = s.metrics.NextSequence(workerID)
+		if err != nil {
+			return status.Error(codes.Internal, err.Error())
+		}
+	}
 
 	worker := &session{
 		stream: stream,
+		closed: make(chan struct{}),
 		state: WorkerSnapshot{
 			ID:              workerID,
 			Hostname:        registration.GetHostname(),
@@ -136,12 +164,14 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[loadtestv1.WorkerMessag
 	if !s.addSession(workerID, worker) {
 		return status.Errorf(codes.AlreadyExists, "worker %q is already connected", workerID)
 	}
-	defer s.removeSession(workerID, worker)
+	disconnectReason := "stream closed"
+	defer func() { s.removeSessionWithReason(workerID, worker, disconnectReason) }()
 
 	if err := worker.send(&loadtestv1.OrchestratorMessage{Payload: &loadtestv1.OrchestratorMessage_RegistrationAck{
 		RegistrationAck: &loadtestv1.RegistrationAck{
-			WorkerId:          workerID,
-			HeartbeatInterval: durationpb.New(s.heartbeatInterval),
+			WorkerId:            workerID,
+			HeartbeatInterval:   durationpb.New(s.heartbeatInterval),
+			NextMetricsSequence: nextMetricsSequence,
 		},
 	}}); err != nil {
 		return err
@@ -151,28 +181,74 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[loadtestv1.WorkerMessag
 		s.assignments.membershipChanged()
 	}
 
+	inbound := make(chan workerReceiveResult, 1)
+	go receiveWorkerMessages(stream, inbound)
+	activityTimeout := 3 * s.heartbeatInterval
+	timer := time.NewTimer(activityTimeout)
+	defer timer.Stop()
 	for {
-		message, err := stream.Recv()
-		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || stream.Context().Err() != nil {
-				return nil
-			}
-			return err
-		}
-		if heartbeat := message.GetHeartbeat(); heartbeat != nil {
-			if err := s.recordHeartbeat(workerID, worker, heartbeat); err != nil {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		case <-worker.closed:
+			return status.Error(codes.Unavailable, "worker session closed")
+		case <-timer.C:
+			disconnectReason = "heartbeat timeout"
+			return status.Error(codes.Unavailable, "worker heartbeat timeout")
+		case received := <-inbound:
+			message, err := received.message, received.err
+			if err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) || stream.Context().Err() != nil {
+					return nil
+				}
 				return err
 			}
-			continue
-		}
-		if delta := message.GetMetrics(); delta != nil && s.metrics != nil {
-			if err := s.metrics.Accept(workerID, delta); err != nil {
-				return status.Error(codes.InvalidArgument, err.Error())
+			if heartbeat := message.GetHeartbeat(); heartbeat != nil {
+				if err := s.recordHeartbeat(workerID, worker, heartbeat); err != nil {
+					disconnectReason = "invalid heartbeat"
+					return err
+				}
+				resetTimer(timer, activityTimeout)
+				continue
 			}
-			continue
+			if delta := message.GetMetrics(); delta != nil && s.metrics != nil {
+				if err := s.recordMetrics(workerID, worker, delta); err != nil {
+					disconnectReason = "invalid metrics delta"
+					return status.Error(codes.InvalidArgument, err.Error())
+				}
+				resetTimer(timer, activityTimeout)
+				continue
+			}
+			return status.Error(codes.FailedPrecondition, "only heartbeats and metric deltas are accepted after registration")
 		}
-		return status.Error(codes.FailedPrecondition, "only heartbeats and metric deltas are accepted after registration")
 	}
+}
+
+func receiveWorkerMessages(
+	stream grpc.BidiStreamingServer[loadtestv1.WorkerMessage, loadtestv1.OrchestratorMessage],
+	inbound chan<- workerReceiveResult,
+) {
+	for {
+		message, err := stream.Recv()
+		select {
+		case inbound <- workerReceiveResult{message: message, err: err}:
+		case <-stream.Context().Done():
+			return
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func resetTimer(timer *time.Timer, timeout time.Duration) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
+		}
+	}
+	timer.Reset(timeout)
 }
 
 // ActiveWorkers returns deterministic copies rather than exposing mutable sessions.
@@ -208,17 +284,35 @@ func (s *Server) addSession(workerID string, worker *session) bool {
 }
 
 func (s *Server) removeSession(workerID string, worker *session) bool {
+	return s.removeSessionWithReason(workerID, worker, "stream closed")
+}
+
+func (s *Server) removeSessionWithReason(workerID string, worker *session, reason string) bool {
 	s.mu.Lock()
 	removed := false
 	if s.sessions[workerID] == worker {
 		delete(s.sessions, workerID)
 		removed = true
+		worker.stop()
+		if s.assignments != nil {
+			s.assignments.workerFailed(workerID, reason, s.now())
+		}
 	}
 	s.mu.Unlock()
 	if removed {
 		s.logger.Printf("worker disconnected: id=%s", workerID)
 	}
 	return removed
+}
+
+func (s *Server) recordMetrics(workerID string, worker *session, delta *loadtestv1.MetricsDelta) error {
+	s.mu.RLock()
+	current := s.sessions[workerID] == worker
+	s.mu.RUnlock()
+	if !current {
+		return errors.New("worker session is no longer active")
+	}
+	return s.metrics.Accept(workerID, delta)
 }
 
 func (s *Server) recordHeartbeat(workerID string, worker *session, heartbeat *loadtestv1.Heartbeat) error {

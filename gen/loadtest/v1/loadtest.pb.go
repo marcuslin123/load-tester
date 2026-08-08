@@ -288,11 +288,12 @@ func (x *Registration) GetSoftwareVersion() string {
 
 // RegistrationAck confirms that the orchestrator accepted the worker identity.
 type RegistrationAck struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	WorkerId          string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
-	HeartbeatInterval *durationpb.Duration   `protobuf:"bytes,2,opt,name=heartbeat_interval,json=heartbeatInterval,proto3" json:"heartbeat_interval,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	WorkerId            string                 `protobuf:"bytes,1,opt,name=worker_id,json=workerId,proto3" json:"worker_id,omitempty"`
+	HeartbeatInterval   *durationpb.Duration   `protobuf:"bytes,2,opt,name=heartbeat_interval,json=heartbeatInterval,proto3" json:"heartbeat_interval,omitempty"`
+	NextMetricsSequence uint64                 `protobuf:"varint,3,opt,name=next_metrics_sequence,json=nextMetricsSequence,proto3" json:"next_metrics_sequence,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *RegistrationAck) Reset() {
@@ -337,6 +338,13 @@ func (x *RegistrationAck) GetHeartbeatInterval() *durationpb.Duration {
 		return x.HeartbeatInterval
 	}
 	return nil
+}
+
+func (x *RegistrationAck) GetNextMetricsSequence() uint64 {
+	if x != nil {
+		return x.NextMetricsSequence
+	}
+	return 0
 }
 
 type HttpTarget struct {
@@ -1220,10 +1228,11 @@ const file_loadtest_v1_loadtest_proto_rawDesc = "" +
 	"\fRegistration\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12\x1a\n" +
 	"\bhostname\x18\x02 \x01(\tR\bhostname\x12)\n" +
-	"\x10software_version\x18\x03 \x01(\tR\x0fsoftwareVersion\"x\n" +
+	"\x10software_version\x18\x03 \x01(\tR\x0fsoftwareVersion\"\xac\x01\n" +
 	"\x0fRegistrationAck\x12\x1b\n" +
 	"\tworker_id\x18\x01 \x01(\tR\bworkerId\x12H\n" +
-	"\x12heartbeat_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x11heartbeatInterval\"\xc6\x01\n" +
+	"\x12heartbeat_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x11heartbeatInterval\x122\n" +
+	"\x15next_metrics_sequence\x18\x03 \x01(\x04R\x13nextMetricsSequence\"\xc6\x01\n" +
 	"\n" +
 	"HttpTarget\x12\x10\n" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12\x16\n" +

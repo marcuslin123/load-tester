@@ -34,22 +34,24 @@ type workerMetricState struct {
 type metricsAggregator struct {
 	mu sync.Mutex
 
-	runID       string
-	assignments map[uint64]map[string]assignmentMetricWindow
-	latest      map[string]assignmentMetricWindow
-	workers     map[string]*workerMetricState
-	snapshot    metrics.Snapshot
-	violations  []string
-	changed     chan struct{}
+	runID        string
+	assignments  map[uint64]map[string]assignmentMetricWindow
+	latest       map[string]assignmentMetricWindow
+	lastAssigned map[string]assignmentMetricWindow
+	workers      map[string]*workerMetricState
+	snapshot     metrics.Snapshot
+	violations   []string
+	changed      chan struct{}
 }
 
 func newMetricsAggregator(runID string) *metricsAggregator {
 	return &metricsAggregator{
-		runID:       runID,
-		assignments: make(map[uint64]map[string]assignmentMetricWindow),
-		latest:      make(map[string]assignmentMetricWindow),
-		workers:     make(map[string]*workerMetricState),
-		changed:     make(chan struct{}, 1),
+		runID:        runID,
+		assignments:  make(map[uint64]map[string]assignmentMetricWindow),
+		latest:       make(map[string]assignmentMetricWindow),
+		lastAssigned: make(map[string]assignmentMetricWindow),
+		workers:      make(map[string]*workerMetricState),
+		changed:      make(chan struct{}, 1),
 	}
 }
 
@@ -72,6 +74,7 @@ func (a *metricsAggregator) RecordAssignments(
 		}
 		windows[workerID] = window
 		latest[workerID] = window
+		a.lastAssigned[workerID] = window
 	}
 	a.assignments[revision] = windows
 	a.latest = latest
@@ -311,6 +314,74 @@ func (a *metricsAggregator) WorkerSnapshots() map[string]metrics.Snapshot {
 		workers[workerID] = cloned
 	}
 	return workers
+}
+
+// NextSequence returns the first sequence a new connection should emit for a
+// stable worker ID without discarding metrics accepted from an older session.
+func (a *metricsAggregator) NextSequence(workerID string) (uint64, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	state := a.workers[workerID]
+	if state == nil {
+		return 1, nil
+	}
+	if state.lastSequence == ^uint64(0) {
+		return 0, fmt.Errorf("worker %s exhausted metric sequence numbers", workerID)
+	}
+	return state.lastSequence + 1, nil
+}
+
+// RecordWorkerFailure marks the run incomplete only when the worker's latest
+// assignment carried load that could have produced an unreported interval.
+func (a *metricsAggregator) RecordWorkerFailure(workerID, reason string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	latest, assigned := a.lastAssigned[workerID]
+	if !assigned || !latest.active {
+		return false
+	}
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "session lost"
+	}
+	a.violations = append(a.violations, fmt.Sprintf(
+		"worker %s failed: %s; unreported metric interval lost",
+		workerID,
+		reason,
+	))
+	a.notify()
+	return true
+}
+
+// AddRecoveryUnmetDemand attributes definitely missed open-model arrivals to
+// the failed worker while preserving its accepted counters and sequence state.
+func (a *metricsAggregator) AddRecoveryUnmetDemand(workerID string, count uint64) error {
+	if strings.TrimSpace(workerID) == "" {
+		return errors.New("recovery worker ID is required")
+	}
+	if count == 0 {
+		return nil
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	addition := metrics.Snapshot{UnmetDemand: count}
+	merged, err := metrics.Merge(a.snapshot, addition)
+	if err != nil {
+		return err
+	}
+	state := a.workers[workerID]
+	if state == nil {
+		state = &workerMetricState{}
+	}
+	workerMerged, err := metrics.Merge(state.snapshot, addition)
+	if err != nil {
+		return err
+	}
+	a.snapshot = merged
+	state.snapshot = workerMerged
+	a.workers[workerID] = state
+	a.notify()
+	return nil
 }
 
 func (a *metricsAggregator) Complete() bool {

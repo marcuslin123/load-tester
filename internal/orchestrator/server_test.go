@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -38,6 +39,9 @@ func TestServerRegistersHeartbeatAndRemovesWorker(t *testing.T) {
 	}
 	if got := ack.GetRegistrationAck().GetHeartbeatInterval().AsDuration(); got != 3*time.Second {
 		t.Fatalf("heartbeat interval = %v, want 3s", got)
+	}
+	if got := ack.GetRegistrationAck().GetNextMetricsSequence(); got != 1 {
+		t.Fatalf("next metrics sequence = %d, want 1", got)
 	}
 
 	worker := waitForWorker(t, server, "worker-1")
@@ -156,6 +160,160 @@ func TestServerRejectsNonIncreasingHeartbeatSequence(t *testing.T) {
 	assertStatusCode(t, err, codes.InvalidArgument)
 }
 
+func TestServerExpiresSilentWorkerAfterThreeHeartbeatIntervals(t *testing.T) {
+	heartbeatInterval := 20 * time.Millisecond
+	server, client := startTestServerWithOptions(t, Options{
+		HeartbeatInterval: heartbeatInterval,
+	}, serverDependencies{now: time.Now})
+	stream, err := client.Connect(context.Background())
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	sendRegistration(t, stream, "worker-silent")
+	if _, err := stream.Recv(); err != nil {
+		t.Fatalf("Recv(ack) error = %v", err)
+	}
+
+	received := receiveAsync(stream)
+	select {
+	case result := <-received:
+		assertStatusCode(t, result.err, codes.Unavailable)
+	case <-time.After(10 * heartbeatInterval):
+		t.Fatal("silent worker stream remained open beyond liveness timeout")
+	}
+	waitForNoWorkers(t, server)
+}
+
+func TestServerValidHeartbeatRenewsWorkerLiveness(t *testing.T) {
+	heartbeatInterval := 50 * time.Millisecond
+	server, client := startTestServerWithOptions(t, Options{
+		HeartbeatInterval: heartbeatInterval,
+	}, serverDependencies{now: time.Now})
+	stream, err := client.Connect(context.Background())
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	sendRegistration(t, stream, "worker-heartbeat")
+	if _, err := stream.Recv(); err != nil {
+		t.Fatalf("Recv(ack) error = %v", err)
+	}
+
+	for sequence := uint64(1); sequence <= 3; sequence++ {
+		time.Sleep(2 * heartbeatInterval)
+		if err := stream.Send(&loadtestv1.WorkerMessage{Payload: &loadtestv1.WorkerMessage_Heartbeat{
+			Heartbeat: &loadtestv1.Heartbeat{
+				WorkerId: "worker-heartbeat",
+				Sequence: sequence,
+				SentAt:   timestamppb.Now(),
+				State:    loadtestv1.WorkerState_WORKER_STATE_IDLE,
+			},
+		}}); err != nil {
+			t.Fatalf("Send(heartbeat %d) error = %v", sequence, err)
+		}
+		waitForWorkerSequence(t, server, "worker-heartbeat", sequence)
+	}
+
+	if workers := server.ActiveWorkers(); len(workers) != 1 {
+		t.Fatalf("active workers = %v, want heartbeat-renewed worker", workers)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend() error = %v", err)
+	}
+}
+
+func TestServerAcceptedMetricsRenewWorkerLiveness(t *testing.T) {
+	heartbeatInterval := 60 * time.Millisecond
+	cfg := assignmentTestConfig(1)
+	cfg.Load.Duration = 2 * time.Second
+	server, client := startTestServerWithOptions(t, Options{
+		HeartbeatInterval: heartbeatInterval,
+		Assignment: &AssignmentOptions{
+			Config:   cfg,
+			RunID:    "test-run",
+			LeadTime: 10 * time.Millisecond,
+		},
+	}, serverDependencies{now: time.Now})
+	stream := registerAssignmentWorker(t, client, "worker-metrics")
+	assignment := receiveAssignment(t, stream)
+
+	time.Sleep(100 * time.Millisecond)
+	delta := metricsDeltaForTest(
+		t,
+		"worker-metrics",
+		assignment.GetRevision(),
+		1,
+		assignment.GetStartsAt().AsTime(),
+		assignment.GetStartsAt().AsTime().Add(time.Second),
+		nil,
+	)
+	delta.RunId = "test-run"
+	if err := stream.Send(&loadtestv1.WorkerMessage{Payload: &loadtestv1.WorkerMessage_Metrics{Metrics: delta}}); err != nil {
+		t.Fatalf("Send(metrics) error = %v", err)
+	}
+
+	time.Sleep(120 * time.Millisecond)
+	if workers := server.ActiveWorkers(); len(workers) != 1 {
+		t.Fatalf("active workers = %v, want metrics-renewed worker", workers)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend() error = %v", err)
+	}
+}
+
+func TestServerReportsHeartbeatTimeoutAsActiveWorkerFailure(t *testing.T) {
+	heartbeatInterval := 20 * time.Millisecond
+	cfg := assignmentTestConfig(1)
+	cfg.Load.Duration = time.Second
+	server, client := startTestServerWithOptions(t, Options{
+		HeartbeatInterval: heartbeatInterval,
+		Assignment: &AssignmentOptions{
+			Config:   cfg,
+			RunID:    "test-run",
+			LeadTime: 10 * time.Millisecond,
+		},
+	}, serverDependencies{now: time.Now})
+	stream := registerAssignmentWorker(t, client, "worker-timeout")
+	receiveAssignment(t, stream)
+
+	_, err := stream.Recv()
+	assertStatusCode(t, err, codes.Unavailable)
+	waitForViolation(t, server.metrics, "heartbeat timeout")
+}
+
+func TestServerRemovedSessionCannotMergeMetrics(t *testing.T) {
+	server, err := newServer(Options{HeartbeatInterval: time.Second}, serverDependencies{now: time.Now})
+	if err != nil {
+		t.Fatalf("newServer() error = %v", err)
+	}
+	server.metrics = newMetricsAggregator("test-run")
+	worker := &session{closed: make(chan struct{}), state: WorkerSnapshot{ID: "worker-stale"}}
+	if !server.addSession("worker-stale", worker) {
+		t.Fatal("addSession() = false, want true")
+	}
+	server.removeSession("worker-stale", worker)
+
+	err = server.recordMetrics("worker-stale", worker, &loadtestv1.MetricsDelta{})
+	if err == nil {
+		t.Fatal("recordMetrics(stale session) error = nil, want rejection")
+	}
+	if got := server.metrics.Snapshot().Requests; got != 0 {
+		t.Fatalf("merged requests = %d, want 0", got)
+	}
+}
+
+func TestSessionDoesNotSendAfterStop(t *testing.T) {
+	worker := &session{
+		stream: &failingAssignmentStream{ctx: context.Background()},
+		closed: make(chan struct{}),
+	}
+	worker.stop()
+
+	err := worker.send(&loadtestv1.OrchestratorMessage{})
+	if !errors.Is(err, errSessionClosed) {
+		t.Fatalf("send(stopped session) error = %v, want errSessionClosed", err)
+	}
+}
+
 func startTestServer(t *testing.T) (*Server, loadtestv1.WorkerControlClient) {
 	t.Helper()
 	return startTestServerWithOptions(t, Options{
@@ -262,6 +420,18 @@ func waitForNoWorkers(t *testing.T, server *Server) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("active workers = %v, want none", server.ActiveWorkers())
+}
+
+func waitForViolation(t *testing.T, aggregator *metricsAggregator, want string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if containsViolation(aggregator.Violations(), want) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("violations = %v, want %q", aggregator.Violations(), want)
 }
 
 func assertStatusCode(t *testing.T, err error, want codes.Code) {

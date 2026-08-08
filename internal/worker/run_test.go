@@ -68,6 +68,34 @@ func TestRunControllerSendsPeriodicAndFinalDeltas(t *testing.T) {
 	}
 }
 
+func TestRunControllerContinuesNegotiatedMetricSequence(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	outbound := make(chan *loadtestv1.WorkerMessage, 4)
+	controller, err := newRunController(context.Background(), "worker-a", outbound, runControllerOptions{
+		ReportingInterval: 10 * time.Millisecond,
+		MetricsBufferSize: 64,
+		InitialSequence:   42,
+	})
+	if err != nil {
+		t.Fatalf("newRunController() error = %v", err)
+	}
+	defer controller.Close()
+	startsAt := time.Now().Add(5 * time.Millisecond)
+	deadline := startsAt.Add(15 * time.Millisecond)
+	if err := controller.Apply(controllerAssignment(target.URL, "run-14", 1, 1, startsAt, deadline)); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+
+	delta := receiveControllerDelta(t, outbound)
+	if delta.GetSequence() != 42 {
+		t.Fatalf("first resumed sequence = %d, want 42", delta.GetSequence())
+	}
+}
+
 func TestRunControllerFlushesOldRevisionBeforeReplacement(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)

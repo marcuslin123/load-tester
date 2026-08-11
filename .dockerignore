@@ -1,0 +1,15 @@
+.git
+.github
+.idea
+.vscode
+.DS_Store
+coverage.out
+*.test
+bin/
+build/
+dist/
+out/
+.cache/
+.superpowers/
+tmp/
+.tmp/

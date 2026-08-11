@@ -529,6 +529,24 @@ Piece 14 redistributes to available and manually started workers only. Docker an
 Kubernetes replacement provisioning remains behind the Fleet Manager introduced
 in Pieces 16 and 20, with automated capacity recovery added by Piece 19.
 
+Piece 15 packages the orchestrator, worker, and target through named targets in
+one root multi-stage `Dockerfile`. Shared dependency layers feed separate static
+Go build stages that honor Docker's target OS and architecture. Each final image
+uses the same distroless non-root runtime in local and production environments,
+contains only its binary and required runtime certificates, and receives standard
+OCI source, version, revision, and title labels. The worker's registration version
+is injected from the same build version argument.
+
+Images do not embed environment-specific addresses or configuration. The
+orchestrator receives a read-only YAML mount and its existing `-config` flag; the
+worker keeps `ORCHESTRATOR_ADDR` and `WORKER_ID`; the target keeps `-addr`.
+Container-to-container traffic uses Docker DNS, while a worker dialing a host
+orchestrator uses the runtime-provided `host.docker.internal` mapping. A
+`.dockerignore` keeps unrelated local state out of the context, and a smoke script
+verifies image metadata, non-root execution, target health, a complete
+three-container run, host dialing, cleanup, and an amd64 cross-build. Compose,
+registries, fleet drivers, and separate debug images are outside Piece 15.
+
 ### Target protocol — HTTP in Layer 1, gRPC in Week 5
 
 **Rejected:** building HTTP, gRPC, and WebSocket simultaneously.

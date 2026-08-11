@@ -398,6 +398,20 @@ on the host.
 **Teaches:** Multi-stage builds, static linking, image size, container
 networking.
 
+**Design decisions:** One root multi-stage `Dockerfile` has shared dependency
+layers, separate build stages, and named `orchestrator`, `worker`, and `target`
+runtime targets. Builds are static and honor Docker's target OS and architecture.
+All runtime targets use the same distroless non-root base in development and
+production; debugging uses logs, inspection, or a separate diagnostic container
+instead of adding tools to application images. Build arguments stamp the worker
+version and standard OCI image labels. Runtime addresses, worker identity, and
+the orchestrator YAML path remain flags, environment variables, and read-only
+mounts rather than image defaults. A `.dockerignore` limits build context, and a
+repeatable smoke script builds and inspects all images, exercises the three
+containers on one Docker network, checks a cross-platform build, and proves a
+worker container can dial an orchestrator on the host. Compose, image publishing,
+and Docker API fleet management remain in later pieces.
+
 ### Piece 16 — Docker fleet driver
 
 **Goal:** `internal/fleet` — the `FleetManager` interface from spec §3 and a

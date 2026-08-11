@@ -431,6 +431,20 @@ with `docker ps`.
 `Teardown` leaving nothing behind is worth being strict about — orphaned
 containers on a laptop are an annoyance, but the same bug against AWS is a bill.
 
+**Design decisions:** The provider-neutral interface exposes `Scale`, `List`, and
+`Teardown`; the Docker implementation uses the official Go SDK through a narrow
+client interface. The driver owns only run-labeled worker containers and attaches
+them to a caller-owned network. Desired counts refer to exactly that many running
+containers, using deterministic numbered worker slots and highest-slot-first
+scale-down. Stopped slots are visible through `List` and replaced only when
+`Scale` is called. Docker running state is the `Scale` contract; worker gRPC
+registration is verified separately by the orchestrator. Scale-up rolls back new
+containers on partial failure, while scale-down and teardown attempt every
+removal and combine errors. Operations are serialized, teardown is idempotent and
+terminal for scaling, and a blocked post-teardown scale must leave zero managed
+containers. Images must already exist locally. Unit tests use a fake Docker
+client; an opt-in integration test verifies real containers and registrations.
+
 ### Piece 17 — Prometheus export and the Compose stack
 
 **Goal:** An orchestrator `/metrics` endpoint carrying fleet-wide series plus

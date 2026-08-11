@@ -34,6 +34,22 @@ scripted multi-step scenarios · historical result storage · orchestrator HA.
 result storage, scripted multi-step scenarios, WebSocket adapter, orchestrator
 high availability.
 
+### Language choice — Go
+
+Go is a strong fit for this infrastructure project because goroutines and
+channels map naturally to concurrent load generation, worker coordination, and
+streaming gRPC connections. Its standard library provides solid HTTP and
+networking primitives, while static compilation produces portable binaries that
+are simple to package into Docker and Kubernetes deployments.
+
+Go also emphasizes readability and consistent software engineering through
+tools such as `gofmt`, `go test`, `go vet`, race detection, fuzzing, and built-in
+module management. This is particularly valuable in an AI-assisted workflow,
+where the important skill is not only generating code quickly, but reviewing,
+verifying, and maintaining it over time. The learning curve is intentional
+because understanding Go concurrency and systems programming is a core goal of
+the project.
+
 ---
 
 ## 2. Architecture
@@ -605,6 +621,38 @@ Averaging percentiles is mathematically invalid. Histograms merge exactly.
 Compose provides a fast local development loop; Kubernetes provides the
 deployment experience the project exists to demonstrate. The interface means the
 orchestrator is byte-identical across both.
+
+Piece 16 introduces the provider-neutral `FleetManager` and `WorkerInfo` types,
+then implements `DockerDriver` with the official Docker Go SDK behind a narrow,
+fakeable client interface. `WorkerInfo` carries a stable worker ID, a
+provider-specific ID such as a container ID or pod UID, and a normalized state.
+The driver receives an existing network, worker image, orchestrator address, run
+ID, and optional host-gateway mapping. It owns only worker containers bearing its
+project, run, and worker labels; the caller owns the network, orchestrator, and
+target.
+
+`Scale(n)` means exactly `n` managed containers must be running. Worker IDs use
+deterministic numbered slots, missing slots are created in ascending order, and
+scale-down removes the highest slots first. Repeating the same desired count is
+idempotent. A stopped container remains observable through `List`, does not
+satisfy the desired running count, and is replaced in the same slot on the next
+`Scale` call. The driver does not install a Docker restart policy or reconcile
+without being called; automatic replacement belongs to Piece 19.
+
+`Scale` waits for Docker's running state, not gRPC registration. The orchestrator
+separately decides whether enough workers registered, which keeps infrastructure
+state separate from application connectivity. A partially failed scale-up rolls
+back only the containers created by that call. Scale-down and teardown attempt
+every requested removal and join any errors. Driver operations are serialized;
+teardown is idempotent, permanently closes scaling with `ErrClosed`, and leaves
+`List` available for an empty post-cleanup observation.
+
+The Docker driver requires its configured image to exist locally; registry pulls
+and authentication remain outside Piece 16. Unit tests use the fake client for
+scaling, rollback, filtering, ordering, cancellation, and terminal-state cases.
+An opt-in Docker integration test independently verifies exact running-container
+counts and eventual orchestrator registration, then proves repeated teardown and
+post-teardown `Scale` cannot create another container.
 
 ### Kubernetes environments — kind locally, EKS on AWS
 

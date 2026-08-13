@@ -24,6 +24,10 @@ FROM build-base AS build-target
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
     -trimpath -ldflags="-s -w" -o /out/target ./cmd/target
 
+FROM build-base AS build-healthcheck
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
+    -trimpath -ldflags="-s -w" -o /out/healthcheck ./cmd/healthcheck
+
 FROM gcr.io/distroless/static-debian12:nonroot AS orchestrator
 ARG VERSION=dev
 ARG VCS_REF=unknown
@@ -33,7 +37,8 @@ LABEL org.opencontainers.image.source="${SOURCE_URL}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.title="load-tester-orchestrator"
 COPY --from=build-orchestrator /out/orchestrator /app/orchestrator
-EXPOSE 9090
+COPY --from=build-healthcheck /out/healthcheck /app/healthcheck
+EXPOSE 9090 9091
 ENTRYPOINT ["/app/orchestrator"]
 
 FROM gcr.io/distroless/static-debian12:nonroot AS worker
@@ -56,5 +61,6 @@ LABEL org.opencontainers.image.source="${SOURCE_URL}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.title="load-tester-target"
 COPY --from=build-target /out/target /app/target
+COPY --from=build-healthcheck /out/healthcheck /app/healthcheck
 EXPOSE 8080
 ENTRYPOINT ["/app/target"]

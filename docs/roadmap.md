@@ -465,6 +465,23 @@ Workers are short-lived and unaddressable, so re-exporting their series through
 the orchestrator keeps per-worker visibility without any service discovery
 configuration.
 
+**Design decisions:** A custom pull collector exports cloned cumulative
+aggregator snapshots rather than maintaining duplicate Prometheus counters. It
+provides separate fleet and `loadtester_worker_*` metric families, classic
+latency histograms with fixed buckets, explicit failure kinds and status codes,
+run metadata, active-worker state, dropped samples, and unmet demand. Inactive
+workers retain their cumulative series until process exit. The orchestrator uses
+separate gRPC (`:9090`) and metrics/health (`:9091`) listeners.
+
+Compose starts the target, a five-minute committed constant-rate demo, fixed
+workers `worker-a` and `worker-b`, Prometheus 3.13.1 with one-second scraping and
+a named data volume, and Grafana 13.1.0 with its Prometheus data source already
+provisioned. Health checks order startup; after the orchestrator exits, workers
+retry with backoff while the observability services remain available. Unit tests
+validate the exporter and HTTP endpoints. A separate Docker smoke test queries
+the real Prometheus API for fleet and per-worker series and cleans up its isolated
+project and volume.
+
 ### Piece 18 — Grafana dashboards **(Phase 3 gate)**
 
 **Goal:** A provisioned dashboard with the panels from spec §7, committed as JSON

@@ -316,6 +316,34 @@ func (a *metricsAggregator) WorkerSnapshots() map[string]metrics.Snapshot {
 	return workers
 }
 
+// PrometheusView clones fleet and worker snapshots under one aggregator lock.
+func (a *metricsAggregator) PrometheusView() metrics.PrometheusView {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	fleet, err := metrics.Merge(a.snapshot)
+	if err != nil {
+		panic("orchestrator: clone merged metrics: " + err.Error())
+	}
+	workers := make(map[string]metrics.Snapshot, len(a.workers))
+	for workerID, state := range a.workers {
+		cloned, err := metrics.Merge(state.snapshot)
+		if err != nil {
+			panic("orchestrator: clone worker metrics: " + err.Error())
+		}
+		workers[workerID] = cloned
+	}
+	return metrics.PrometheusView{Fleet: fleet, Workers: workers}
+}
+
+// RegisterWorker retains a worker in cumulative metrics without advancing sequence.
+func (a *metricsAggregator) RegisterWorker(workerID string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.workers[workerID] == nil {
+		a.workers[workerID] = &workerMetricState{}
+	}
+}
+
 // NextSequence returns the first sequence a new connection should emit for a
 // stable worker ID without discarding metrics accepted from an older session.
 func (a *metricsAggregator) NextSequence(workerID string) (uint64, error) {

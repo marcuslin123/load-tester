@@ -1,0 +1,105 @@
+name: load-tester
+
+services:
+  target:
+    build:
+      context: .
+      target: target
+    ports:
+      - "127.0.0.1:8080:8080"
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "-url", "http://127.0.0.1:8080/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 1s
+
+  orchestrator:
+    build:
+      context: .
+      target: orchestrator
+    command: ["-config", "/app/config/demo.yaml", "-metrics-addr", ":9091"]
+    depends_on:
+      target:
+        condition: service_healthy
+    volumes:
+      - ./deploy/compose/demo.yaml:/app/config/demo.yaml:ro
+    ports:
+      - "127.0.0.1:9091:9091"
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "/app/healthcheck", "-url", "http://127.0.0.1:9091/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 1s
+
+  worker-a:
+    build:
+      context: .
+      target: worker
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    environment:
+      ORCHESTRATOR_ADDR: orchestrator:9090
+      WORKER_ID: worker-a
+    restart: "no"
+
+  worker-b:
+    build:
+      context: .
+      target: worker
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    environment:
+      ORCHESTRATOR_ADDR: orchestrator:9090
+      WORKER_ID: worker-b
+    restart: "no"
+
+  prometheus:
+    image: prom/prometheus:v3.13.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+    volumes:
+      - ./deploy/compose/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "/bin/wget", "-q", "--spider", "http://127.0.0.1:9090/-/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 1s
+
+  grafana:
+    image: grafana/grafana:13.1.0
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./deploy/compose/grafana/provisioning/datasources/prometheus.yml:/etc/grafana/provisioning/datasources/prometheus.yml:ro
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "/usr/bin/wget", "-q", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 1s
+
+volumes:
+  prometheus-data:

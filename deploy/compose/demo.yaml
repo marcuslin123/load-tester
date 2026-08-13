@@ -1,0 +1,22 @@
+name: compose-demo
+
+target:
+  protocol: http
+  method: GET
+  url: http://target:8080/echo?latency=50ms&error_rate=0.05
+
+load:
+  model: constant-rate
+  rate: 200
+  max_in_flight: 100
+  duration: 5m
+  ramp_up: 15s
+
+fleet:
+  min_workers: 2
+  max_workers: 2
+  autoscale: false
+
+thresholds:
+  p99_latency: 100ms
+  error_rate: 0.10

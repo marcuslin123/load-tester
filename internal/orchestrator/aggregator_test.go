@@ -60,6 +60,68 @@ func TestMetricsAggregatorMergesWorkerCountersAndHistograms(t *testing.T) {
 	}
 }
 
+func TestMetricsAggregatorPrometheusViewKeepsAcceptedVersionsConsistent(t *testing.T) {
+	started := time.Now().UTC().Truncate(time.Second)
+	aggregator := newMetricsAggregator("run-view")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-view", 1, 1, started, started.Add(2*time.Second)),
+	})
+	first := metricsDeltaForTest(
+		t,
+		"worker-a",
+		1,
+		1,
+		started,
+		started.Add(time.Second),
+		[]protocol.Result{{Latency: time.Millisecond, StatusCode: 200}},
+	)
+	first.RunId = "run-view"
+	if err := aggregator.Accept("worker-a", first); err != nil {
+		t.Fatalf("Accept(first) error = %v", err)
+	}
+	second := metricsDeltaForTest(
+		t,
+		"worker-a",
+		1,
+		2,
+		started.Add(time.Second),
+		started.Add(2*time.Second),
+		[]protocol.Result{{Latency: time.Millisecond, StatusCode: 200}},
+		true,
+	)
+	second.RunId = "run-view"
+
+	aggregator.mu.Lock()
+	viewStarted := make(chan struct{})
+	acceptStarted := make(chan struct{})
+	viewResult := make(chan metrics.PrometheusView, 1)
+	acceptResult := make(chan error, 1)
+	go func() {
+		close(viewStarted)
+		viewResult <- aggregator.PrometheusView()
+	}()
+	go func() {
+		close(acceptStarted)
+		acceptResult <- aggregator.Accept("worker-a", second)
+	}()
+	<-viewStarted
+	<-acceptStarted
+	aggregator.mu.Unlock()
+
+	view := <-viewResult
+	if err := <-acceptResult; err != nil {
+		t.Fatalf("Accept(second) error = %v", err)
+	}
+	fleetRequests := view.Fleet.Requests
+	workerRequests := view.Workers["worker-a"].Requests
+	if fleetRequests != workerRequests {
+		t.Fatalf("concurrent PrometheusView() = (fleet=%d worker=%d), want one accepted version", fleetRequests, workerRequests)
+	}
+	if fleetRequests != 1 && fleetRequests != 2 {
+		t.Fatalf("concurrent PrometheusView() version = %d, want 1 or 2", fleetRequests)
+	}
+}
+
 func TestMetricsAggregatorIgnoresExactDuplicate(t *testing.T) {
 	started := time.Now()
 	deadline := started.Add(time.Second)

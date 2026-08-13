@@ -48,12 +48,12 @@ assert_field() {
 assert_image_contract() {
   local target=$1
   local expected_entrypoint=$2
-  local expected_port=$3
+  local expected_ports=$3
   local expected_title=$4
   local image="$IMAGE_PREFIX-$target:$VERSION"
   local actual_user actual_entrypoint actual_ports actual_architecture
   local actual_source actual_version actual_revision actual_title
-  local expected_entrypoint_json expected_ports
+  local expected_entrypoint_json expected_ports_json
 
   actual_user=$(docker image inspect --format '{{.Config.User}}' "$image")
   if [[ "$actual_user" != 'nonroot' && "$actual_user" != '65532' ]]; then
@@ -79,12 +79,39 @@ assert_image_contract() {
   assert_field "$target" 'Config.Entrypoint' "$actual_entrypoint" "$expected_entrypoint_json"
 
   actual_ports=$(docker image inspect --format '{{json .Config.ExposedPorts}}' "$image")
-  if [[ -n "$expected_port" ]]; then
-    expected_ports=$(printf '{"%s":{}}' "$expected_port")
-  else
-    expected_ports=null
+  case "$expected_ports" in
+    '') expected_ports_json=null ;;
+    '8080/tcp') expected_ports_json='{"8080/tcp":{}}' ;;
+    '9090/tcp 9091/tcp') expected_ports_json='{"9090/tcp":{},"9091/tcp":{}}' ;;
+    *)
+      printf 'Unknown expected port contract for %s: %q\n' "$target" "$expected_ports" >&2
+      return 1
+      ;;
+  esac
+  assert_field "$target" 'Config.ExposedPorts' "$actual_ports" "$expected_ports_json"
+}
+
+assert_image_path() {
+  local target=$1
+  local path=$2
+  local image="$IMAGE_PREFIX-$target:$VERSION"
+  local probe_container="${IMAGE_PREFIX}-${target}-path-probe-$$"
+  local destination="$TMP_DIR/$target-$(basename "$path")"
+
+  docker create --name "$probe_container" "$image" >/dev/null
+  KNOWN_CONTAINERS+=("$probe_container")
+  if ! docker cp "$probe_container:$path" "$destination" >/dev/null 2>&1; then
+    printf 'ASSERTION FAILED target=%s field=image_path actual=missing expected=%q\n' \
+      "$target" "$path" >&2
+    return 1
   fi
-  assert_field "$target" 'Config.ExposedPorts' "$actual_ports" "$expected_ports"
+  if [[ ! -s "$destination" ]]; then
+    printf 'ASSERTION FAILED target=%s field=image_path actual=empty expected=%q\n' \
+      "$target" "$path" >&2
+    return 1
+  fi
+  cleanup_container "$probe_container"
+  printf 'Image path: PASS (target=%s path=%s)\n' "$target" "$path"
 }
 
 KEEP_IMAGES=${KEEP_IMAGES:-0}
@@ -209,9 +236,11 @@ for target in orchestrator worker target; do
     .
 done
 
-assert_image_contract orchestrator /app/orchestrator 9090/tcp load-tester-orchestrator
+assert_image_contract orchestrator /app/orchestrator '9090/tcp 9091/tcp' load-tester-orchestrator
 assert_image_contract worker /app/worker '' load-tester-worker
 assert_image_contract target /app/target 8080/tcp load-tester-target
+assert_image_path orchestrator /app/healthcheck
+assert_image_path target /app/healthcheck
 
 assert_log_contains() {
   local container=$1

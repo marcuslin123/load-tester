@@ -6,10 +6,13 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
 	loadtestv1 "github.com/marcuslin123/load-tester/gen/loadtest/v1"
+	"github.com/marcuslin123/load-tester/internal/metrics"
+	"github.com/marcuslin123/load-tester/internal/protocol"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -298,6 +301,135 @@ func TestServerRemovedSessionCannotMergeMetrics(t *testing.T) {
 	}
 	if got := server.metrics.Snapshot().Requests; got != 0 {
 		t.Fatalf("merged requests = %d, want 0", got)
+	}
+}
+
+func TestServerFleetMetricsReturnsClone(t *testing.T) {
+	t.Parallel()
+
+	server, err := newServer(Options{HeartbeatInterval: time.Second}, serverDependencies{now: time.Now})
+	if err != nil {
+		t.Fatalf("newServer() error = %v", err)
+	}
+	collector, err := metrics.NewCollector(1)
+	if err != nil {
+		t.Fatalf("NewCollector() error = %v", err)
+	}
+	if !collector.Offer(protocol.Result{Latency: time.Millisecond, StatusCode: 200}) {
+		t.Fatal("Offer() = false, want true")
+	}
+	server.metrics = newMetricsAggregator("test-run")
+	server.metrics.snapshot = collector.Close()
+
+	first := server.FleetMetrics()
+	first.StatusCodes[200] = 999
+	second := server.FleetMetrics()
+	if got := second.StatusCodes[200]; got != 1 {
+		t.Fatalf("second fleet status count = %d, want 1", got)
+	}
+}
+
+func TestServerActiveWorkerIDsAreSorted(t *testing.T) {
+	t.Parallel()
+
+	server, err := newServer(Options{HeartbeatInterval: time.Second}, serverDependencies{now: time.Now})
+	if err != nil {
+		t.Fatalf("newServer() error = %v", err)
+	}
+	server.metrics = newMetricsAggregator("test-run")
+	for _, workerID := range []string{"worker-c", "worker-a", "worker-b"} {
+		if !server.addSession(workerID, &session{closed: make(chan struct{}), state: WorkerSnapshot{ID: workerID}}) {
+			t.Fatalf("addSession(%q) = false, want true", workerID)
+		}
+	}
+
+	if got, want := server.ActiveWorkerIDs(), []string{"worker-a", "worker-b", "worker-c"}; !slices.Equal(got, want) {
+		t.Fatalf("ActiveWorkerIDs() = %v, want %v", got, want)
+	}
+}
+
+func TestServerPrometheusSourceMethodsAreEmptyWithoutAssignmentMetrics(t *testing.T) {
+	t.Parallel()
+
+	server, err := newServer(Options{HeartbeatInterval: time.Second}, serverDependencies{now: time.Now})
+	if err != nil {
+		t.Fatalf("newServer() error = %v", err)
+	}
+	if !server.addSession("worker-a", &session{closed: make(chan struct{}), state: WorkerSnapshot{ID: "worker-a"}}) {
+		t.Fatal("addSession() = false, want true")
+	}
+
+	if got := server.FleetMetrics(); got.Requests != 0 {
+		t.Fatalf("FleetMetrics().Requests = %d, want 0", got.Requests)
+	}
+	if got := server.ActiveWorkerIDs(); len(got) != 0 {
+		t.Fatalf("ActiveWorkerIDs() = %v, want none", got)
+	}
+}
+
+func TestServerWorkerMetricsRetainDisconnectedWorkers(t *testing.T) {
+	t.Parallel()
+
+	server, err := newServer(Options{HeartbeatInterval: time.Second}, serverDependencies{now: time.Now})
+	if err != nil {
+		t.Fatalf("newServer() error = %v", err)
+	}
+	server.metrics = newMetricsAggregator("test-run")
+	server.metrics.workers["worker-b"] = &workerMetricState{snapshot: metrics.Snapshot{Requests: 3}}
+	worker := &session{closed: make(chan struct{}), state: WorkerSnapshot{ID: "worker-b"}}
+	if !server.addSession("worker-b", worker) {
+		t.Fatal("addSession() = false, want true")
+	}
+
+	server.removeSession("worker-b", worker)
+	if got := server.WorkerMetrics()["worker-b"].Requests; got != 3 {
+		t.Fatalf("WorkerMetrics()[worker-b].Requests = %d, want 3", got)
+	}
+	if got := server.ActiveWorkerIDs(); len(got) != 0 {
+		t.Fatalf("ActiveWorkerIDs() = %v, want none", got)
+	}
+}
+
+func TestServerRetainsRegisteredWorkerAfterNoDeltaDisconnect(t *testing.T) {
+	server, client := startTestServerWithOptions(t, Options{
+		HeartbeatInterval: time.Second,
+		Assignment: &AssignmentOptions{
+			Config:   assignmentTestConfig(2),
+			RunID:    "test-run",
+			LeadTime: time.Second,
+		},
+	}, serverDependencies{now: time.Now})
+	stream, err := client.Connect(context.Background())
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	sendRegistration(t, stream, "worker-no-delta")
+	ack, err := stream.Recv()
+	if err != nil {
+		t.Fatalf("Recv(ack) error = %v", err)
+	}
+	if got := ack.GetRegistrationAck().GetNextMetricsSequence(); got != 1 {
+		t.Fatalf("next metrics sequence = %d, want 1", got)
+	}
+	if err := stream.CloseSend(); err != nil {
+		t.Fatalf("CloseSend() error = %v", err)
+	}
+	waitForNoWorkers(t, server)
+
+	view := server.PrometheusView()
+	if len(view.ActiveWorkerIDs) != 0 {
+		t.Fatalf("active worker IDs = %v, want none", view.ActiveWorkerIDs)
+	}
+	worker, retained := view.Workers["worker-no-delta"]
+	if !retained {
+		t.Fatal("worker-no-delta was not retained after disconnect")
+	}
+	if worker.Requests != 0 || worker.ObservationCount() != 0 {
+		t.Fatalf("retained worker metrics = %+v count=%d, want zero", worker, worker.ObservationCount())
+	}
+	next, err := server.metrics.NextSequence("worker-no-delta")
+	if err != nil || next != 1 {
+		t.Fatalf("NextSequence() = (%d, %v), want (1, nil)", next, err)
 	}
 }
 

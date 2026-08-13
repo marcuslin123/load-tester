@@ -46,6 +46,34 @@ func (s Snapshot) Percentile(percentile float64) time.Duration {
 	return time.Duration(s.latencies.ValueAtPercentile(percentile)) * time.Microsecond
 }
 
+// CumulativeLatencyCounts returns counts at each requested latency bound.
+func (s Snapshot) CumulativeLatencyCounts(bounds []time.Duration) []uint64 {
+	counts := make([]uint64, len(bounds))
+	if s.latencies == nil || s.latencies.TotalCount() == 0 {
+		return counts
+	}
+
+	distribution := s.latencies.Distribution()
+	for i, bound := range bounds {
+		boundMicros := bound.Microseconds()
+		for _, bar := range distribution {
+			if bar.To > boundMicros {
+				break
+			}
+			counts[i] += uint64(bar.Count)
+		}
+	}
+	return counts
+}
+
+// LatencySumSeconds returns the approximate sum of recorded latencies.
+func (s Snapshot) LatencySumSeconds() float64 {
+	if s.latencies == nil || s.latencies.TotalCount() == 0 {
+		return 0
+	}
+	return s.latencies.Mean() * float64(s.latencies.TotalCount()) / 1e6
+}
+
 // Merge adds interval histograms and counters so percentiles describe the full
 // request population rather than an average of worker percentiles.
 func Merge(snapshots ...Snapshot) (Snapshot, error) {

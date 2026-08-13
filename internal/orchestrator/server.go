@@ -176,6 +176,9 @@ func (s *Server) Connect(stream grpc.BidiStreamingServer[loadtestv1.WorkerMessag
 	}}); err != nil {
 		return err
 	}
+	if s.metrics != nil {
+		s.metrics.RegisterWorker(workerID)
+	}
 	s.logger.Printf("worker registered: id=%s hostname=%s version=%s", workerID, worker.state.Hostname, worker.state.SoftwareVersion)
 	if s.assignments != nil {
 		s.assignments.membershipChanged()
@@ -271,6 +274,43 @@ func (s *Server) WorkerMetrics() map[string]metrics.Snapshot {
 		return map[string]metrics.Snapshot{}
 	}
 	return s.metrics.WorkerSnapshots()
+}
+
+// FleetMetrics returns an independent cumulative snapshot for Prometheus export.
+func (s *Server) FleetMetrics() metrics.Snapshot {
+	if s.metrics == nil {
+		return metrics.Snapshot{}
+	}
+	return s.metrics.Snapshot()
+}
+
+// ActiveWorkerIDs returns active worker IDs in deterministic order.
+func (s *Server) ActiveWorkerIDs() []string {
+	if s.metrics == nil {
+		return []string{}
+	}
+	workers := s.ActiveWorkers()
+	workerIDs := make([]string, len(workers))
+	for i, worker := range workers {
+		workerIDs[i] = worker.ID
+	}
+	return workerIDs
+}
+
+// PrometheusView returns one immutable fleet, worker, and activity view.
+func (s *Server) PrometheusView() metrics.PrometheusView {
+	if s.metrics == nil {
+		return metrics.PrometheusView{}
+	}
+	s.mu.RLock()
+	view := s.metrics.PrometheusView()
+	view.ActiveWorkerIDs = make([]string, 0, len(s.sessions))
+	for workerID := range s.sessions {
+		view.ActiveWorkerIDs = append(view.ActiveWorkerIDs, workerID)
+	}
+	s.mu.RUnlock()
+	slices.Sort(view.ActiveWorkerIDs)
+	return view
 }
 
 func (s *Server) addSession(workerID string, worker *session) bool {

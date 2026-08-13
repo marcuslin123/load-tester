@@ -347,6 +347,34 @@ orchestrator; it never discovers individual workers. This avoids needing service
 discovery configuration in both Compose and Kubernetes, while preserving
 per-worker visibility.
 
+A custom pull collector reads one immutable view containing cloned cumulative
+fleet and per-worker snapshots plus active worker IDs on each scrape. Fleet and
+worker snapshots are cloned under one aggregator lock acquisition, so a scrape
+cannot mix accepted-delta versions, while Prometheus export does not duplicate
+mutable metric state. It converts the HDR latency distribution into a classic
+Prometheus histogram with cumulative buckets at 1ms, 5ms, 10ms, 25ms,
+50ms, 100ms, 250ms, 500ms, 1s, 2.5s, 5s, and 10s. Histogram count and the
+HDR-derived sum retain the same bounded approximation as the source histogram.
+Fixed-boundary counts conservatively include only HDR bars whose quantized upper
+value is at or below `le`, so a boundary bar may be deferred to the next bucket
+under the existing three-significant-figure approximation but is never counted
+below its possible upper value. Native histograms remain a future option once
+their Go client API is stable.
+
+Fleet series cover run metadata, active workers, requests, failures by transport,
+client, and server kind, exact HTTP status codes, response bytes, dropped
+samples, unmet demand, and request duration. Equivalent `loadtester_worker_*`
+series use `worker_id`; registered workers remain exported with their cumulative
+values and an active value of zero until the orchestrator exits, including when
+they disconnect before emitting a first delta.
+Succeeded requests, requests per second, error rate, and latency percentiles are
+derived in PromQL instead of duplicated as mutable gauges.
+
+The orchestrator serves gRPC on `:9090` and metrics plus `/healthz` on `:9091`.
+The health endpoint reports only that both process listeners are ready; target
+and worker health remain separate concerns. Failure to bind either listener is a
+setup failure, and both listeners stop with the run.
+
 Grafana dashboard panels:
 
 - Requests/second over time
@@ -357,8 +385,14 @@ Grafana dashboard panels:
 - Per-worker RPS contribution
 - Dropped samples
 
-Prometheus and Grafana run as containers in the same Compose file, so
-`docker compose up` brings up the entire stack including dashboards.
+Prometheus and Grafana run as containers in the same Compose file. A committed
+five-minute constant-rate demo starts automatically against two fixed workers,
+`worker-a` and `worker-b`; dynamic worker provisioning remains a later piece.
+Prometheus scrapes every second and retains data in a named volume. Grafana has
+its Prometheus data source provisioned with local-only `admin` credentials;
+dashboard provisioning remains the next piece. After the bounded orchestrator
+run exits, workers stop load generation and continue their normal reconnect
+backoff while Prometheus and Grafana remain available for inspection.
 
 ---
 

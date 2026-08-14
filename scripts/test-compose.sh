@@ -29,7 +29,10 @@ COMPOSE_PROJECT_NAME="loadtester-smoke-$(date +%s)-$$-$RANDOM"
 export COMPOSE_PROJECT_NAME
 COMPOSE=(docker compose --project-name "$COMPOSE_PROJECT_NAME" --file "$REPO_ROOT/compose.yaml")
 PROMETHEUS_URL=${PROMETHEUS_URL:-http://localhost:9090}
-TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-120}
+GRAFANA_URL=${GRAFANA_URL:-http://localhost:3000}
+GRAFANA_USER=${GRAFANA_USER:-admin}
+GRAFANA_PASSWORD=${GRAFANA_PASSWORD:-admin}
+TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-240}
 STACK_STARTED=0
 CLEANED_UP=0
 
@@ -39,6 +42,14 @@ REQUESTS_RESPONSE='not queried'
 ACTIVE_WORKERS_RESPONSE='not queried'
 WORKER_A_RESPONSE='not queried'
 WORKER_B_RESPONSE='not queried'
+GRAFANA_HEALTH_RESPONSE='not queried'
+GRAFANA_DATASOURCE_RESPONSE='not queried'
+GRAFANA_DASHBOARD_RESPONSE='not queried'
+GRAFANA_RPS_RESPONSE='not queried'
+GRAFANA_LATENCY_RESPONSE='not queried'
+GRAFANA_ERROR_RESPONSE='not queried'
+GRAFANA_STATUS_RESPONSE='not queried'
+GRAFANA_WORKER_RESPONSE='not queried'
 
 print_diagnostics() {
   printf '\nCompose smoke diagnostics (project=%s)\n' "$COMPOSE_PROJECT_NAME" >&2
@@ -56,6 +67,22 @@ print_diagnostics() {
   printf '%s\n' "$WORKER_A_RESPONSE" >&2
   printf '%s\n' '--- Prometheus query: worker-b requests > 0 ---' >&2
   printf '%s\n' "$WORKER_B_RESPONSE" >&2
+  printf '%s\n' '--- Grafana /api/health ---' >&2
+  printf '%s\n' "$GRAFANA_HEALTH_RESPONSE" >&2
+  printf '%s\n' '--- Grafana Prometheus datasource health ---' >&2
+  printf '%s\n' "$GRAFANA_DATASOURCE_RESPONSE" >&2
+  printf '%s\n' '--- Grafana provisioned dashboard ---' >&2
+  printf '%s\n' "$GRAFANA_DASHBOARD_RESPONSE" >&2
+  printf '%s\n' '--- Grafana proxy query: requests per second ---' >&2
+  printf '%s\n' "$GRAFANA_RPS_RESPONSE" >&2
+  printf '%s\n' '--- Grafana proxy query: p99 latency ---' >&2
+  printf '%s\n' "$GRAFANA_LATENCY_RESPONSE" >&2
+  printf '%s\n' '--- Grafana proxy query: error rate by kind ---' >&2
+  printf '%s\n' "$GRAFANA_ERROR_RESPONSE" >&2
+  printf '%s\n' '--- Grafana proxy query: status codes ---' >&2
+  printf '%s\n' "$GRAFANA_STATUS_RESPONSE" >&2
+  printf '%s\n' '--- Grafana proxy query: per-worker RPS ---' >&2
+  printf '%s\n' "$GRAFANA_WORKER_RESPONSE" >&2
   printf '%s\n' '--- docker compose logs (last 200 lines) ---' >&2
   "${COMPOSE[@]}" logs --no-color --tail 200 >&2 || true
 }
@@ -116,6 +143,14 @@ query_prometheus() {
     "$PROMETHEUS_URL/api/v1/query"
 }
 
+query_grafana_prometheus() {
+  local expression=$1
+
+  curl_snapshot --user "$GRAFANA_USER:$GRAFANA_PASSWORD" --get \
+    --data-urlencode "query=$expression" \
+    "$GRAFANA_URL/api/datasources/proxy/uid/prometheus/api/v1/query"
+}
+
 query_has_result() {
   local response=$1
 
@@ -124,6 +159,41 @@ query_has_result() {
     .data.resultType == "vector" and
     (.data.result | type) == "array" and
     (.data.result | length) > 0
+  ' >/dev/null 2>&1
+}
+
+query_has_positive_finite_result() {
+  local response=$1
+
+  printf '%s\n' "$response" | jq -e '
+    .status == "success" and
+    .data.resultType == "vector" and
+    any(.data.result[]?;
+      (.value[1] != "NaN") and
+      (.value[1] != "+Inf") and
+      (.value[1] != "Inf") and
+      (.value[1] != "-Inf") and
+      ((.value[1] | tonumber) > 0)
+    )
+  ' >/dev/null 2>&1
+}
+
+query_has_positive_label() {
+  local response=$1
+  local label=$2
+  local value=$3
+
+  printf '%s\n' "$response" | jq -e --arg label "$label" --arg value "$value" '
+    .status == "success" and
+    .data.resultType == "vector" and
+    any(.data.result[]?;
+      (.metric[$label] == $value) and
+      (.value[1] != "NaN") and
+      (.value[1] != "+Inf") and
+      (.value[1] != "Inf") and
+      (.value[1] != "-Inf") and
+      ((.value[1] | tonumber) > 0)
+    )
   ' >/dev/null 2>&1
 }
 
@@ -137,6 +207,34 @@ target_is_up() {
       .scrapeUrl == "http://orchestrator:9091/metrics" and
       .health == "up"
     )
+  ' >/dev/null 2>&1
+}
+
+grafana_is_ready() {
+  local response=$1
+
+  printf '%s\n' "$response" | jq -e '
+    .database == "ok" and
+    .version == "13.1.0"
+  ' >/dev/null 2>&1
+}
+
+grafana_datasource_is_healthy() {
+  local response=$1
+
+  printf '%s\n' "$response" | jq -e '
+    .status == "OK"
+  ' >/dev/null 2>&1
+}
+
+grafana_dashboard_is_provisioned() {
+  local response=$1
+
+  printf '%s\n' "$response" | jq -e '
+    .dashboard.uid == "load-tester-overview" and
+    .dashboard.title == "Load Tester Overview" and
+    (.dashboard.panels | length) == 11 and
+    .meta.provisioned == true
   ' >/dev/null 2>&1
 }
 
@@ -176,6 +274,20 @@ while (( SECONDS < deadline )); do
   ACTIVE_WORKERS_RESPONSE=$(query_prometheus 'loadtester_active_workers == 2')
   WORKER_A_RESPONSE=$(query_prometheus 'loadtester_worker_requests_total{worker_id="worker-a"} > 0')
   WORKER_B_RESPONSE=$(query_prometheus 'loadtester_worker_requests_total{worker_id="worker-b"} > 0')
+  GRAFANA_HEALTH_RESPONSE=$(curl_snapshot "$GRAFANA_URL/api/health")
+  GRAFANA_DATASOURCE_RESPONSE=$(curl_snapshot --user "$GRAFANA_USER:$GRAFANA_PASSWORD" \
+    "$GRAFANA_URL/api/datasources/uid/prometheus/health")
+  GRAFANA_DASHBOARD_RESPONSE=$(curl_snapshot --user "$GRAFANA_USER:$GRAFANA_PASSWORD" \
+    "$GRAFANA_URL/api/dashboards/uid/load-tester-overview")
+  GRAFANA_RPS_RESPONSE=$(query_grafana_prometheus 'rate(loadtester_requests_total[10s])')
+  GRAFANA_LATENCY_RESPONSE=$(query_grafana_prometheus \
+    'histogram_quantile(0.99, sum by (le) (rate(loadtester_request_duration_seconds_bucket[10s])))')
+  GRAFANA_ERROR_RESPONSE=$(query_grafana_prometheus \
+    'sum by (kind) (rate(loadtester_request_failures_total[10s])) / ignoring(kind) group_left clamp_min(sum(rate(loadtester_requests_total[10s])), 1e-9)')
+  GRAFANA_STATUS_RESPONSE=$(query_grafana_prometheus \
+    'sum by (code) (rate(loadtester_http_responses_total[10s]))')
+  GRAFANA_WORKER_RESPONSE=$(query_grafana_prometheus \
+    'sum by (worker_id) (rate(loadtester_worker_requests_total[10s]))')
 
   if (( containers_ready )) && \
      [[ "$READY_RESPONSE" == 'Prometheus Server is Ready.' ]] && \
@@ -183,7 +295,16 @@ while (( SECONDS < deadline )); do
      query_has_result "$REQUESTS_RESPONSE" && \
      query_has_result "$ACTIVE_WORKERS_RESPONSE" && \
      query_has_result "$WORKER_A_RESPONSE" && \
-     query_has_result "$WORKER_B_RESPONSE"; then
+     query_has_result "$WORKER_B_RESPONSE" && \
+     grafana_is_ready "$GRAFANA_HEALTH_RESPONSE" && \
+     grafana_datasource_is_healthy "$GRAFANA_DATASOURCE_RESPONSE" && \
+     grafana_dashboard_is_provisioned "$GRAFANA_DASHBOARD_RESPONSE" && \
+     query_has_positive_finite_result "$GRAFANA_RPS_RESPONSE" && \
+     query_has_positive_finite_result "$GRAFANA_LATENCY_RESPONSE" && \
+     query_has_positive_label "$GRAFANA_ERROR_RESPONSE" kind server && \
+     query_has_positive_label "$GRAFANA_STATUS_RESPONSE" code 200 && \
+     query_has_positive_label "$GRAFANA_WORKER_RESPONSE" worker_id worker-a && \
+     query_has_positive_label "$GRAFANA_WORKER_RESPONSE" worker_id worker-b; then
     printf 'Compose containers: PASS (target=%s orchestrator=%s worker-a=%s worker-b=%s prometheus=%s grafana=%s)\n' \
       "$target_status" "$orchestrator_status" "$worker_a_status" "$worker_b_status" \
       "$prometheus_status" "$grafana_status"
@@ -193,6 +314,10 @@ while (( SECONDS < deadline )); do
     printf 'Prometheus active workers: PASS (%s)\n' "$ACTIVE_WORKERS_RESPONSE"
     printf 'Prometheus worker-a series: PASS (%s)\n' "$WORKER_A_RESPONSE"
     printf 'Prometheus worker-b series: PASS (%s)\n' "$WORKER_B_RESPONSE"
+    printf 'Grafana health: PASS (%s)\n' "$GRAFANA_HEALTH_RESPONSE"
+    printf 'Grafana datasource: PASS (%s)\n' "$GRAFANA_DATASOURCE_RESPONSE"
+    printf 'Grafana dashboard: PASS (uid=load-tester-overview panels=11 provisioned=true)\n'
+    printf 'Grafana dashboard queries: PASS (rps=p99=positive server-error=positive status-200=positive worker-a=positive worker-b=positive)\n'
     exit 0
   fi
 

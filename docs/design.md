@@ -384,13 +384,24 @@ Grafana dashboard panels:
 - Active worker count (scaling events appear as steps)
 - Per-worker RPS contribution
 - Dropped samples
+- Unmet demand
+
+The provisioned **Load Tester Overview** dashboard opens with compact current
+RPS, error rate, active worker, dropped sample, and unmet demand stats. Detailed
+time-series panels show fleet RPS; p50, p95, and p99 latency; total error rate
+plus transport, client, and server breakdowns; exact HTTP status codes; stacked
+per-worker RPS; and active workers over time. The demo dashboard draws a fixed
+100ms latency threshold matching its committed configuration. Status codes and
+per-worker contribution are stacked so changes in composition remain visible
+without hiding total throughput.
 
 Prometheus and Grafana run as containers in the same Compose file. A committed
 five-minute constant-rate demo starts automatically against two fixed workers,
 `worker-a` and `worker-b`; dynamic worker provisioning remains a later piece.
 Prometheus scrapes every second and retains data in a named volume. Grafana has
-its Prometheus data source provisioned with local-only `admin` credentials;
-dashboard provisioning remains the next piece. After the bounded orchestrator
+its Prometheus data source and read-only dashboard provisioned with local-only
+`admin` credentials. Dashboard JSON is committed and loaded automatically, so a
+clean checkout requires no manual Grafana setup. After the bounded orchestrator
 run exits, workers stop load generation and continue their normal reconnect
 backoff while Prometheus and Grafana remain available for inspection.
 

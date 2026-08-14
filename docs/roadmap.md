@@ -499,6 +499,16 @@ Provisioning matters for a resume project specifically: a reviewer who has to
 hand-build a dashboard will never see it. This is also where the screenshot for
 the README comes from.
 
+**Design decisions:** Provision one read-only **Load Tester Overview** dashboard
+from committed JSON. Its top row shows current RPS, total error rate, active
+workers, dropped samples, and unmet demand. Time-series panels show fleet RPS;
+p50, p95, and p99 with the demo's fixed 100ms threshold; total error rate plus
+failure-kind breakdowns; exact status codes; stacked per-worker RPS; and active
+workers. Status codes are stacked with semantic success, client-error, and
+server-error colors. The Compose smoke test verifies dashboard provisioning,
+datasource health, and representative live queries through Grafana's datasource
+proxy rather than only checking the files on disk.
+
 ---
 
 ## Phase 4 — Autoscaling and Kubernetes

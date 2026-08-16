@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -30,6 +31,8 @@ type Options struct {
 	Network             string
 	OrchestratorAddress string
 	AddHostGateway      bool
+	// WorkerCPUs limits each worker container's CPU when greater than zero.
+	WorkerCPUs float64
 }
 
 type Driver struct {
@@ -63,6 +66,7 @@ type engineContainer struct {
 type containerSpec struct {
 	Name          string
 	Image         string
+	WorkerCPUs    float64
 	Env           []string
 	Labels        map[string]string
 	Network       string
@@ -87,6 +91,9 @@ func newDriver(ctx context.Context, options Options, client engineClient) (*Driv
 	if options.OrchestratorAddress == "" {
 		return nil, fmt.Errorf("orchestrator address is required")
 	}
+	if err := ValidateWorkerCPUs(options.WorkerCPUs); err != nil {
+		return nil, err
+	}
 
 	exists, err := client.ImageExists(ctx, options.Image)
 	if err != nil {
@@ -102,6 +109,21 @@ func newDriver(ctx context.Context, options Options, client engineClient) (*Driv
 		startTimeout: 10 * time.Second,
 		sleep:        sleepContext,
 	}, nil
+}
+
+// ValidateWorkerCPUs rejects limits Docker cannot represent in whole NanoCPUs.
+func ValidateWorkerCPUs(value float64) error {
+	if value == 0 {
+		return nil
+	}
+	if value < 1e-9 || math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Errorf("worker CPU limit must be zero or at least one finite NanoCPU")
+	}
+	nanoCPUs := math.Round(value * 1_000_000_000)
+	if nanoCPUs < 1 || nanoCPUs >= math.Exp2(63) {
+		return fmt.Errorf("worker CPU limit exceeds Docker's NanoCPU range")
+	}
+	return nil
 }
 
 // List returns every container owned by this run, including stopped workers.
@@ -180,6 +202,52 @@ func (d *Driver) Scale(ctx context.Context, desired int) error {
 		if err := d.waitRunning(ctx, id); err != nil {
 			return d.rollback(ctx, created, fmt.Errorf("wait for worker slot %d: %w", slot, err))
 		}
+	}
+	return nil
+}
+
+// Replace removes and recreates the managed container for one stable worker ID.
+func (d *Driver) Replace(ctx context.Context, workerID string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.closed {
+		return fleet.ErrClosed
+	}
+	workers, err := d.listManaged(ctx)
+	if err != nil {
+		return fmt.Errorf("list managed containers: %w", err)
+	}
+	var target *managedWorker
+	for index := range workers {
+		if workers[index].workerID == workerID {
+			target = &workers[index]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("managed worker %q was not found", workerID)
+	}
+	if err := d.client.Remove(ctx, target.container.ID); err != nil {
+		return fmt.Errorf("remove worker slot %d: %w", target.slot, err)
+	}
+
+	preexisting := make(map[string]struct{}, len(workers)-1)
+	for _, worker := range workers {
+		if worker.container.ID != target.container.ID {
+			preexisting[worker.container.ID] = struct{}{}
+		}
+	}
+	id, err := d.client.Create(ctx, d.containerSpec(target.slot))
+	if err != nil {
+		return d.rollbackAmbiguousCreate(ctx, preexisting, nil, fmt.Errorf("create replacement worker slot %d: %w", target.slot, err))
+	}
+	created := []string{id}
+	if err := d.client.Start(ctx, id); err != nil {
+		return d.rollback(ctx, created, fmt.Errorf("start replacement worker slot %d: %w", target.slot, err))
+	}
+	if err := d.waitRunning(ctx, id); err != nil {
+		return d.rollback(ctx, created, fmt.Errorf("wait for replacement worker slot %d: %w", target.slot, err))
 	}
 	return nil
 }
@@ -354,6 +422,7 @@ func (d *Driver) containerSpec(slot int) containerSpec {
 	spec := containerSpec{
 		Name:          workerID,
 		Image:         d.options.Image,
+		WorkerCPUs:    d.options.WorkerCPUs,
 		Env:           []string{"ORCHESTRATOR_ADDR=" + d.options.OrchestratorAddress, "WORKER_ID=" + workerID},
 		Labels:        ownershipLabels(d.options.RunID, workerID, slot),
 		Network:       d.options.Network,

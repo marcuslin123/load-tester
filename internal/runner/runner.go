@@ -22,6 +22,7 @@ type resultSink interface {
 
 type openSink interface {
 	resultSink
+	OfferAdmittedArrival() bool
 	OfferUnmetDemand() bool
 }
 

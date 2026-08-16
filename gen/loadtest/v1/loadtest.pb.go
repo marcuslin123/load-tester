@@ -484,14 +484,17 @@ func (*Target_Http) isTarget_Protocol() {}
 
 // LoadSlice is the portion of fleet-wide load assigned to one worker.
 type LoadSlice struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Model         LoadModel              `protobuf:"varint,1,opt,name=model,proto3,enum=loadtest.v1.LoadModel" json:"model,omitempty"`
-	VirtualUsers  uint64                 `protobuf:"varint,2,opt,name=virtual_users,json=virtualUsers,proto3" json:"virtual_users,omitempty"`
-	Rate          uint64                 `protobuf:"varint,3,opt,name=rate,proto3" json:"rate,omitempty"`
-	MaxInFlight   uint64                 `protobuf:"varint,4,opt,name=max_in_flight,json=maxInFlight,proto3" json:"max_in_flight,omitempty"`
-	RampUp        *durationpb.Duration   `protobuf:"bytes,5,opt,name=ramp_up,json=rampUp,proto3" json:"ramp_up,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	Model              LoadModel              `protobuf:"varint,1,opt,name=model,proto3,enum=loadtest.v1.LoadModel" json:"model,omitempty"`
+	VirtualUsers       uint64                 `protobuf:"varint,2,opt,name=virtual_users,json=virtualUsers,proto3" json:"virtual_users,omitempty"`
+	Rate               uint64                 `protobuf:"varint,3,opt,name=rate,proto3" json:"rate,omitempty"`
+	MaxInFlight        uint64                 `protobuf:"varint,4,opt,name=max_in_flight,json=maxInFlight,proto3" json:"max_in_flight,omitempty"`
+	RampUp             *durationpb.Duration   `protobuf:"bytes,5,opt,name=ramp_up,json=rampUp,proto3" json:"ramp_up,omitempty"`
+	GlobalRate         uint64                 `protobuf:"varint,6,opt,name=global_rate,json=globalRate,proto3" json:"global_rate,omitempty"`
+	ScheduleShardIndex uint64                 `protobuf:"varint,7,opt,name=schedule_shard_index,json=scheduleShardIndex,proto3" json:"schedule_shard_index,omitempty"`
+	ScheduleShardCount uint64                 `protobuf:"varint,8,opt,name=schedule_shard_count,json=scheduleShardCount,proto3" json:"schedule_shard_count,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *LoadSlice) Reset() {
@@ -559,6 +562,27 @@ func (x *LoadSlice) GetRampUp() *durationpb.Duration {
 	return nil
 }
 
+func (x *LoadSlice) GetGlobalRate() uint64 {
+	if x != nil {
+		return x.GlobalRate
+	}
+	return 0
+}
+
+func (x *LoadSlice) GetScheduleShardIndex() uint64 {
+	if x != nil {
+		return x.ScheduleShardIndex
+	}
+	return 0
+}
+
+func (x *LoadSlice) GetScheduleShardCount() uint64 {
+	if x != nil {
+		return x.ScheduleShardCount
+	}
+	return 0
+}
+
 // LoadAssignment completely replaces any older assignment for the same run.
 type LoadAssignment struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -568,6 +592,7 @@ type LoadAssignment struct {
 	Load          *LoadSlice             `protobuf:"bytes,4,opt,name=load,proto3" json:"load,omitempty"`
 	StartsAt      *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=starts_at,json=startsAt,proto3" json:"starts_at,omitempty"`
 	Deadline      *timestamppb.Timestamp `protobuf:"bytes,6,opt,name=deadline,proto3" json:"deadline,omitempty"`
+	ActivatesAt   *timestamppb.Timestamp `protobuf:"bytes,7,opt,name=activates_at,json=activatesAt,proto3" json:"activates_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -644,20 +669,28 @@ func (x *LoadAssignment) GetDeadline() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *LoadAssignment) GetActivatesAt() *timestamppb.Timestamp {
+	if x != nil {
+		return x.ActivatesAt
+	}
+	return nil
+}
+
 type MetricCounters struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	Requests        uint64                 `protobuf:"varint,1,opt,name=requests,proto3" json:"requests,omitempty"`
-	Succeeded       uint64                 `protobuf:"varint,2,opt,name=succeeded,proto3" json:"succeeded,omitempty"`
-	Failed          uint64                 `protobuf:"varint,3,opt,name=failed,proto3" json:"failed,omitempty"`
-	TransportErrors uint64                 `protobuf:"varint,4,opt,name=transport_errors,json=transportErrors,proto3" json:"transport_errors,omitempty"`
-	ClientErrors    uint64                 `protobuf:"varint,5,opt,name=client_errors,json=clientErrors,proto3" json:"client_errors,omitempty"`
-	ServerErrors    uint64                 `protobuf:"varint,6,opt,name=server_errors,json=serverErrors,proto3" json:"server_errors,omitempty"`
-	BytesRead       uint64                 `protobuf:"varint,7,opt,name=bytes_read,json=bytesRead,proto3" json:"bytes_read,omitempty"`
-	DroppedSamples  uint64                 `protobuf:"varint,8,opt,name=dropped_samples,json=droppedSamples,proto3" json:"dropped_samples,omitempty"`
-	UnmetDemand     uint64                 `protobuf:"varint,9,opt,name=unmet_demand,json=unmetDemand,proto3" json:"unmet_demand,omitempty"`
-	StatusCodes     map[int32]uint64       `protobuf:"bytes,10,rep,name=status_codes,json=statusCodes,proto3" json:"status_codes,omitempty" protobuf_key:"varint,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Requests         uint64                 `protobuf:"varint,1,opt,name=requests,proto3" json:"requests,omitempty"`
+	Succeeded        uint64                 `protobuf:"varint,2,opt,name=succeeded,proto3" json:"succeeded,omitempty"`
+	Failed           uint64                 `protobuf:"varint,3,opt,name=failed,proto3" json:"failed,omitempty"`
+	TransportErrors  uint64                 `protobuf:"varint,4,opt,name=transport_errors,json=transportErrors,proto3" json:"transport_errors,omitempty"`
+	ClientErrors     uint64                 `protobuf:"varint,5,opt,name=client_errors,json=clientErrors,proto3" json:"client_errors,omitempty"`
+	ServerErrors     uint64                 `protobuf:"varint,6,opt,name=server_errors,json=serverErrors,proto3" json:"server_errors,omitempty"`
+	BytesRead        uint64                 `protobuf:"varint,7,opt,name=bytes_read,json=bytesRead,proto3" json:"bytes_read,omitempty"`
+	DroppedSamples   uint64                 `protobuf:"varint,8,opt,name=dropped_samples,json=droppedSamples,proto3" json:"dropped_samples,omitempty"`
+	UnmetDemand      uint64                 `protobuf:"varint,9,opt,name=unmet_demand,json=unmetDemand,proto3" json:"unmet_demand,omitempty"`
+	StatusCodes      map[int32]uint64       `protobuf:"bytes,10,rep,name=status_codes,json=statusCodes,proto3" json:"status_codes,omitempty" protobuf_key:"varint,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"`
+	AdmittedArrivals uint64                 `protobuf:"varint,11,opt,name=admitted_arrivals,json=admittedArrivals,proto3" json:"admitted_arrivals,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *MetricCounters) Reset() {
@@ -758,6 +791,13 @@ func (x *MetricCounters) GetStatusCodes() map[int32]uint64 {
 		return x.StatusCodes
 	}
 	return nil
+}
+
+func (x *MetricCounters) GetAdmittedArrivals() uint64 {
+	if x != nil {
+		return x.AdmittedArrivals
+	}
+	return 0
 }
 
 // MetricsDelta contains one reporting interval and is sequenced per worker and run.
@@ -1245,20 +1285,25 @@ const file_loadtest_v1_loadtest_proto_rawDesc = "" +
 	"\x06Target\x12-\n" +
 	"\x04http\x18\x01 \x01(\v2\x17.loadtest.v1.HttpTargetH\x00R\x04httpB\n" +
 	"\n" +
-	"\bprotocol\"\xca\x01\n" +
+	"\bprotocol\"\xcf\x02\n" +
 	"\tLoadSlice\x12,\n" +
 	"\x05model\x18\x01 \x01(\x0e2\x16.loadtest.v1.LoadModelR\x05model\x12#\n" +
 	"\rvirtual_users\x18\x02 \x01(\x04R\fvirtualUsers\x12\x12\n" +
 	"\x04rate\x18\x03 \x01(\x04R\x04rate\x12\"\n" +
 	"\rmax_in_flight\x18\x04 \x01(\x04R\vmaxInFlight\x122\n" +
-	"\aramp_up\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\x06rampUp\"\x8d\x02\n" +
+	"\aramp_up\x18\x05 \x01(\v2\x19.google.protobuf.DurationR\x06rampUp\x12\x1f\n" +
+	"\vglobal_rate\x18\x06 \x01(\x04R\n" +
+	"globalRate\x120\n" +
+	"\x14schedule_shard_index\x18\a \x01(\x04R\x12scheduleShardIndex\x120\n" +
+	"\x14schedule_shard_count\x18\b \x01(\x04R\x12scheduleShardCount\"\xcc\x02\n" +
 	"\x0eLoadAssignment\x12\x15\n" +
 	"\x06run_id\x18\x01 \x01(\tR\x05runId\x12\x1a\n" +
 	"\brevision\x18\x02 \x01(\x04R\brevision\x12+\n" +
 	"\x06target\x18\x03 \x01(\v2\x13.loadtest.v1.TargetR\x06target\x12*\n" +
 	"\x04load\x18\x04 \x01(\v2\x16.loadtest.v1.LoadSliceR\x04load\x127\n" +
 	"\tstarts_at\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\bstartsAt\x126\n" +
-	"\bdeadline\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\bdeadline\"\xd3\x03\n" +
+	"\bdeadline\x18\x06 \x01(\v2\x1a.google.protobuf.TimestampR\bdeadline\x12=\n" +
+	"\factivates_at\x18\a \x01(\v2\x1a.google.protobuf.TimestampR\vactivatesAt\"\x80\x04\n" +
 	"\x0eMetricCounters\x12\x1a\n" +
 	"\brequests\x18\x01 \x01(\x04R\brequests\x12\x1c\n" +
 	"\tsucceeded\x18\x02 \x01(\x04R\tsucceeded\x12\x16\n" +
@@ -1271,7 +1316,8 @@ const file_loadtest_v1_loadtest_proto_rawDesc = "" +
 	"\x0fdropped_samples\x18\b \x01(\x04R\x0edroppedSamples\x12!\n" +
 	"\funmet_demand\x18\t \x01(\x04R\vunmetDemand\x12O\n" +
 	"\fstatus_codes\x18\n" +
-	" \x03(\v2,.loadtest.v1.MetricCounters.StatusCodesEntryR\vstatusCodes\x1a>\n" +
+	" \x03(\v2,.loadtest.v1.MetricCounters.StatusCodesEntryR\vstatusCodes\x12+\n" +
+	"\x11admitted_arrivals\x18\v \x01(\x04R\x10admittedArrivals\x1a>\n" +
 	"\x10StatusCodesEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\x05R\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"\xf4\x03\n" +
@@ -1378,27 +1424,28 @@ var file_loadtest_v1_loadtest_proto_depIdxs = []int32{
 	8,  // 6: loadtest.v1.LoadAssignment.load:type_name -> loadtest.v1.LoadSlice
 	19, // 7: loadtest.v1.LoadAssignment.starts_at:type_name -> google.protobuf.Timestamp
 	19, // 8: loadtest.v1.LoadAssignment.deadline:type_name -> google.protobuf.Timestamp
-	17, // 9: loadtest.v1.MetricCounters.status_codes:type_name -> loadtest.v1.MetricCounters.StatusCodesEntry
-	19, // 10: loadtest.v1.MetricsDelta.interval_start:type_name -> google.protobuf.Timestamp
-	19, // 11: loadtest.v1.MetricsDelta.interval_end:type_name -> google.protobuf.Timestamp
-	10, // 12: loadtest.v1.MetricsDelta.counters:type_name -> loadtest.v1.MetricCounters
-	2,  // 13: loadtest.v1.MetricsDelta.histogram_encoding:type_name -> loadtest.v1.HistogramEncoding
-	19, // 14: loadtest.v1.Heartbeat.sent_at:type_name -> google.protobuf.Timestamp
-	0,  // 15: loadtest.v1.Heartbeat.state:type_name -> loadtest.v1.WorkerState
-	3,  // 16: loadtest.v1.StopCommand.reason:type_name -> loadtest.v1.StopReason
-	4,  // 17: loadtest.v1.WorkerMessage.registration:type_name -> loadtest.v1.Registration
-	11, // 18: loadtest.v1.WorkerMessage.metrics:type_name -> loadtest.v1.MetricsDelta
-	12, // 19: loadtest.v1.WorkerMessage.heartbeat:type_name -> loadtest.v1.Heartbeat
-	5,  // 20: loadtest.v1.OrchestratorMessage.registration_ack:type_name -> loadtest.v1.RegistrationAck
-	9,  // 21: loadtest.v1.OrchestratorMessage.assignment:type_name -> loadtest.v1.LoadAssignment
-	13, // 22: loadtest.v1.OrchestratorMessage.stop:type_name -> loadtest.v1.StopCommand
-	14, // 23: loadtest.v1.WorkerControl.Connect:input_type -> loadtest.v1.WorkerMessage
-	15, // 24: loadtest.v1.WorkerControl.Connect:output_type -> loadtest.v1.OrchestratorMessage
-	24, // [24:25] is the sub-list for method output_type
-	23, // [23:24] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	19, // 9: loadtest.v1.LoadAssignment.activates_at:type_name -> google.protobuf.Timestamp
+	17, // 10: loadtest.v1.MetricCounters.status_codes:type_name -> loadtest.v1.MetricCounters.StatusCodesEntry
+	19, // 11: loadtest.v1.MetricsDelta.interval_start:type_name -> google.protobuf.Timestamp
+	19, // 12: loadtest.v1.MetricsDelta.interval_end:type_name -> google.protobuf.Timestamp
+	10, // 13: loadtest.v1.MetricsDelta.counters:type_name -> loadtest.v1.MetricCounters
+	2,  // 14: loadtest.v1.MetricsDelta.histogram_encoding:type_name -> loadtest.v1.HistogramEncoding
+	19, // 15: loadtest.v1.Heartbeat.sent_at:type_name -> google.protobuf.Timestamp
+	0,  // 16: loadtest.v1.Heartbeat.state:type_name -> loadtest.v1.WorkerState
+	3,  // 17: loadtest.v1.StopCommand.reason:type_name -> loadtest.v1.StopReason
+	4,  // 18: loadtest.v1.WorkerMessage.registration:type_name -> loadtest.v1.Registration
+	11, // 19: loadtest.v1.WorkerMessage.metrics:type_name -> loadtest.v1.MetricsDelta
+	12, // 20: loadtest.v1.WorkerMessage.heartbeat:type_name -> loadtest.v1.Heartbeat
+	5,  // 21: loadtest.v1.OrchestratorMessage.registration_ack:type_name -> loadtest.v1.RegistrationAck
+	9,  // 22: loadtest.v1.OrchestratorMessage.assignment:type_name -> loadtest.v1.LoadAssignment
+	13, // 23: loadtest.v1.OrchestratorMessage.stop:type_name -> loadtest.v1.StopCommand
+	14, // 24: loadtest.v1.WorkerControl.Connect:input_type -> loadtest.v1.WorkerMessage
+	15, // 25: loadtest.v1.WorkerControl.Connect:output_type -> loadtest.v1.OrchestratorMessage
+	25, // [25:26] is the sub-list for method output_type
+	24, // [24:25] is the sub-list for method input_type
+	24, // [24:24] is the sub-list for extension type_name
+	24, // [24:24] is the sub-list for extension extendee
+	0,  // [0:24] is the sub-list for field type_name
 }
 
 func init() { file_loadtest_v1_loadtest_proto_init() }

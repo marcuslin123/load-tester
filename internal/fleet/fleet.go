@@ -11,6 +11,7 @@ var ErrClosed = errors.New("fleet manager is closed")
 // FleetManager controls worker capacity without exposing provider-specific APIs.
 type FleetManager interface {
 	Scale(ctx context.Context, desired int) error
+	Replace(ctx context.Context, workerID string) error
 	List(ctx context.Context) ([]WorkerInfo, error)
 	Teardown(ctx context.Context) error
 }

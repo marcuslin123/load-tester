@@ -15,16 +15,17 @@ const (
 
 // Snapshot contains the metrics collected during one reporting interval.
 type Snapshot struct {
-	Requests        uint64
-	Succeeded       uint64
-	Failed          uint64
-	TransportErrors uint64
-	ClientErrors    uint64
-	ServerErrors    uint64
-	BytesRead       uint64
-	DroppedSamples  uint64
-	UnmetDemand     uint64
-	StatusCodes     map[int]uint64
+	Requests         uint64
+	Succeeded        uint64
+	Failed           uint64
+	TransportErrors  uint64
+	ClientErrors     uint64
+	ServerErrors     uint64
+	BytesRead        uint64
+	DroppedSamples   uint64
+	AdmittedArrivals uint64
+	UnmetDemand      uint64
+	StatusCodes      map[int]uint64
 
 	latencies *hdrhistogram.Histogram
 }
@@ -92,6 +93,7 @@ func Merge(snapshots ...Snapshot) (Snapshot, error) {
 			{name: "server errors", value: &merged.ServerErrors, add: snapshot.ServerErrors},
 			{name: "bytes read", value: &merged.BytesRead, add: snapshot.BytesRead},
 			{name: "dropped samples", value: &merged.DroppedSamples, add: snapshot.DroppedSamples},
+			{name: "admitted arrivals", value: &merged.AdmittedArrivals, add: snapshot.AdmittedArrivals},
 			{name: "unmet demand", value: &merged.UnmetDemand, add: snapshot.UnmetDemand},
 		}
 		for _, counter := range counters {

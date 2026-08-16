@@ -433,6 +433,56 @@ func TestServerRetainsRegisteredWorkerAfterNoDeltaDisconnect(t *testing.T) {
 	}
 }
 
+func TestServerPrometheusViewIncludesConfiguredAutoscalerSnapshot(t *testing.T) {
+	server, err := newServer(Options{
+		HeartbeatInterval: time.Second,
+		Assignment: &AssignmentOptions{
+			Context:  context.Background(),
+			Config:   assignmentTestConfig(1),
+			RunID:    "test-run",
+			LeadTime: time.Second,
+		},
+	}, serverDependencies{now: time.Now})
+	if err != nil {
+		t.Fatalf("newServer() error = %v", err)
+	}
+	want := metrics.AutoscalerView{Enabled: true, DesiredWorkers: 3, SchedulerCoverage: 0.84}
+	server.SetAutoscalerMetricsSource(autoscalerMetricsSourceStub{view: want})
+
+	if got := server.PrometheusView().Autoscaler; got != want {
+		t.Fatalf("autoscaler view = %+v, want %+v", got, want)
+	}
+}
+
+func TestServerArrivalWindowDelegatesExactCountersAndCompleteness(t *testing.T) {
+	started := time.Now()
+	boundary := started.Add(time.Second)
+	deadline := started.Add(2 * time.Second)
+	aggregator := newMetricsAggregator("run-arrival-window")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-arrival-window", 1, 1, started, deadline),
+	})
+	delta := metricsDeltaForTest(t, "worker-a", 1, 1, started, boundary, nil)
+	delta.RunId = "run-arrival-window"
+	delta.Counters.AdmittedArrivals = 90
+	delta.Counters.UnmetDemand = 10
+	if err := aggregator.Accept("worker-a", delta); err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	server := &Server{metrics: aggregator}
+
+	got := server.ArrivalWindow(started, boundary)
+	if got.Admitted != 90 || got.Unmet != 10 || !got.Complete {
+		t.Fatalf("ArrivalWindow() = %+v, want admitted=90 unmet=10 complete=true", got)
+	}
+}
+
+type autoscalerMetricsSourceStub struct {
+	view metrics.AutoscalerView
+}
+
+func (s autoscalerMetricsSourceStub) AutoscalerMetrics() metrics.AutoscalerView { return s.view }
+
 func TestSessionDoesNotSendAfterStop(t *testing.T) {
 	worker := &session{
 		stream: &failingAssignmentStream{ctx: context.Background()},

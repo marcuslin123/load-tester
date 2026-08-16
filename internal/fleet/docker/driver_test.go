@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"errors"
+	"math"
 	"reflect"
 	"strconv"
 	"strings"
@@ -31,6 +32,12 @@ func TestNewDriverValidatesOptions(t *testing.T) {
 		{name: "network", change: func(options *Options) { options.Network = "" }, want: "network"},
 		{name: "orchestrator address", change: func(options *Options) { options.OrchestratorAddress = "" }, want: "orchestrator address"},
 		{name: "unsafe run ID", change: func(options *Options) { options.RunID = "run/id" }, want: "run ID"},
+		{name: "negative worker CPUs", change: func(options *Options) { options.WorkerCPUs = -0.25 }, want: "worker CPU limit"},
+		{name: "NaN worker CPUs", change: func(options *Options) { options.WorkerCPUs = math.NaN() }, want: "worker CPU limit"},
+		{name: "positive infinite worker CPUs", change: func(options *Options) { options.WorkerCPUs = math.Inf(1) }, want: "worker CPU limit"},
+		{name: "negative infinite worker CPUs", change: func(options *Options) { options.WorkerCPUs = math.Inf(-1) }, want: "worker CPU limit"},
+		{name: "sub NanoCPU worker CPUs", change: func(options *Options) { options.WorkerCPUs = 0.5e-9 }, want: "worker CPU limit"},
+		{name: "overflowing worker CPUs", change: func(options *Options) { options.WorkerCPUs = 10_000_000_000 }, want: "worker CPU limit"},
 	}
 
 	for _, test := range tests {
@@ -71,6 +78,7 @@ func TestContainerSpecConfiguresWorkerOwnershipAndConnectivity(t *testing.T) {
 		Network:             "piece-16",
 		OrchestratorAddress: "host.docker.internal:9090",
 		AddHostGateway:      true,
+		WorkerCPUs:          0.25,
 	}, &fakeEngine{imageExists: true})
 	if err != nil {
 		t.Fatalf("newDriver() error = %v", err)
@@ -80,6 +88,7 @@ func TestContainerSpecConfiguresWorkerOwnershipAndConnectivity(t *testing.T) {
 	want := containerSpec{
 		Name:          "run-16-worker-2",
 		Image:         "load-tester-worker:test",
+		WorkerCPUs:    0.25,
 		Env:           []string{"ORCHESTRATOR_ADDR=host.docker.internal:9090", "WORKER_ID=run-16-worker-2"},
 		Labels:        ownershipLabels("run-16", "run-16-worker-2", 2),
 		Network:       "piece-16",
@@ -127,6 +136,27 @@ func TestMobyCreateOptionsTranslateContainerSpec(t *testing.T) {
 	}
 	if got.HostConfig.RestartPolicy.Name != containertypes.RestartPolicyDisabled {
 		t.Fatalf("restart policy = %q, want disabled", got.HostConfig.RestartPolicy.Name)
+	}
+}
+
+func TestMobyCreateOptionsOmitsWorkerCPULimitWhenZero(t *testing.T) {
+	got := toMobyCreateOptions(containerSpec{WorkerCPUs: 0})
+	if got.HostConfig.Resources.NanoCPUs != 0 {
+		t.Fatalf("NanoCPUs = %d, want unlimited zero value", got.HostConfig.Resources.NanoCPUs)
+	}
+}
+
+func TestMobyCreateOptionsConvertsWorkerCPUsToNanoCPUs(t *testing.T) {
+	got := toMobyCreateOptions(containerSpec{WorkerCPUs: 0.25})
+	if got.HostConfig.Resources.NanoCPUs != 250000000 {
+		t.Fatalf("NanoCPUs = %d, want 250000000", got.HostConfig.Resources.NanoCPUs)
+	}
+}
+
+func TestMobyCreateOptionsRoundsFractionalNanoCPUs(t *testing.T) {
+	got := toMobyCreateOptions(containerSpec{WorkerCPUs: 1.6e-9})
+	if got.HostConfig.Resources.NanoCPUs != 2 {
+		t.Fatalf("NanoCPUs = %d, want rounded value 2", got.HostConfig.Resources.NanoCPUs)
 	}
 }
 
@@ -246,6 +276,31 @@ func TestScaleReplacesStoppedContainerInSameSlot(t *testing.T) {
 	}
 	if !reflect.DeepEqual(engine.removed, []string{"stopped"}) || len(engine.created) != 1 || engine.created[0].Name != "run-16-worker-1" {
 		t.Fatalf("replacement removed=%v created=%v, want stopped removed and slot 1 recreated", engine.removed, specNames(engine.created))
+	}
+}
+
+func TestReplaceRecreatesRunningContainerInExactStableSlot(t *testing.T) {
+	engine := &fakeEngine{
+		imageExists:       true,
+		runningAfterStart: true,
+		containers: []engineContainer{
+			managedContainer("one", "run-16", 1, "running", true),
+			managedContainer("two", "run-16", 2, "running", true),
+		},
+	}
+	driver := mustNewDriver(t, engine)
+
+	if err := driver.Replace(context.Background(), "run-16-worker-2"); err != nil {
+		t.Fatalf("Replace() error = %v", err)
+	}
+	if want := []string{"two"}; !reflect.DeepEqual(engine.removed, want) {
+		t.Fatalf("removed containers = %v, want %v", engine.removed, want)
+	}
+	if got, want := specNames(engine.created), []string{"run-16-worker-2"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("created containers = %v, want %v", got, want)
+	}
+	if len(engine.containers) != 2 {
+		t.Fatalf("containers after replacement = %v, want two slots", engine.containers)
 	}
 }
 

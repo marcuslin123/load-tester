@@ -13,11 +13,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	loadtestv1 "github.com/marcuslin123/load-tester/gen/loadtest/v1"
+	"github.com/marcuslin123/load-tester/internal/autoscale"
 	loadconfig "github.com/marcuslin123/load-tester/internal/config"
+	"github.com/marcuslin123/load-tester/internal/fleet"
+	"github.com/marcuslin123/load-tester/internal/fleet/docker"
 	"github.com/marcuslin123/load-tester/internal/metrics"
 	"github.com/marcuslin123/load-tester/internal/orchestrator"
 	"github.com/marcuslin123/load-tester/internal/report"
@@ -27,10 +31,13 @@ import (
 )
 
 const (
-	heartbeatInterval  = 3 * time.Second
-	assignmentLeadTime = time.Second
-	metricsGracePeriod = 2 * time.Second
-	httpShutdownPeriod = 5 * time.Second
+	heartbeatInterval    = 3 * time.Second
+	assignmentLeadTime   = time.Second
+	metricsGracePeriod   = 4 * time.Second
+	metricsDeliveryDelay = 3 * time.Second
+	httpShutdownPeriod   = 5 * time.Second
+	workerStartupTimeout = 30 * time.Second
+	fleetCleanupPeriod   = 5 * time.Second
 )
 
 type exitCode int
@@ -43,14 +50,47 @@ const (
 )
 
 type cliOptions struct {
-	address        string
-	metricsAddress string
-	configPath     string
+	address                   string
+	metricsAddress            string
+	configPath                string
+	fleetDriver               fleetDriver
+	workerStartupTimeout      time.Duration
+	workerImage               string
+	dockerNetwork             string
+	workerOrchestratorAddress string
+	dockerAddHostGateway      bool
+	dockerWorkerCPUs          float64
 }
+
+type fleetDriver string
+
+const (
+	fleetDriverManual fleetDriver = "manual"
+	fleetDriverDocker fleetDriver = "docker"
+)
 
 type runResult struct {
 	summary report.Summary
 	err     error
+}
+
+type managedController interface {
+	Prepare(context.Context) error
+	Run(context.Context, autoscale.RunWindow) error
+	AutoscalerMetrics() metrics.AutoscalerView
+}
+
+type managedControllerFactory func(
+	fleet.FleetManager,
+	*orchestrator.Server,
+	loadconfig.Config,
+	cliOptions,
+	*log.Logger,
+) (managedController, error)
+
+type runWindowSource interface {
+	WaitForRunWindow(context.Context) (orchestrator.RunWindow, error)
+	RecordInfrastructureViolation(string)
 }
 
 func main() {
@@ -70,12 +110,16 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, logge
 		fmt.Fprintf(stderr, "orchestrator: %v\n", err)
 		return exitSetupFailure
 	}
+	if err := validateFleetSelection(options, cfg); err != nil {
+		fmt.Fprintf(stderr, "orchestrator: %v\n", err)
+		return exitSetupFailure
+	}
 	runID, err := newRunID()
 	if err != nil {
 		fmt.Fprintf(stderr, "orchestrator: generate run ID: %v\n", err)
 		return exitSetupFailure
 	}
-	summary, err := run(ctx, options.address, options.metricsAddress, cfg, runID, logger)
+	summary, err := runWithOptions(ctx, options, cfg, runID, logger, newDockerFleetManager, newManagedController)
 	if err != nil {
 		fmt.Fprintf(stderr, "orchestrator: %v\n", err)
 		return exitSetupFailure
@@ -87,12 +131,81 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, logge
 	return exitCodeForSummary(summary)
 }
 
+type dockerFleetFactory func(context.Context, docker.Options) (fleet.FleetManager, error)
+
+func validateFleetSelection(options cliOptions, cfg loadconfig.Config) error {
+	if options.fleetDriver == fleetDriverManual && cfg.Fleet.Autoscale {
+		return errors.New("manual fleet driver cannot be used with fleet.autoscale: true")
+	}
+	return nil
+}
+
+func newFleetManager(
+	ctx context.Context,
+	options cliOptions,
+	runID string,
+	newDockerFleet dockerFleetFactory,
+) (fleet.FleetManager, error) {
+	switch options.fleetDriver {
+	case fleetDriverManual:
+		return nil, nil
+	case fleetDriverDocker:
+		manager, err := newDockerFleet(ctx, docker.Options{
+			RunID:               runID,
+			Image:               options.workerImage,
+			Network:             options.dockerNetwork,
+			OrchestratorAddress: options.workerOrchestratorAddress,
+			AddHostGateway:      options.dockerAddHostGateway,
+			WorkerCPUs:          options.dockerWorkerCPUs,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create Docker fleet driver: %w", err)
+		}
+		return manager, nil
+	default:
+		return nil, fmt.Errorf("unknown fleet driver %q", options.fleetDriver)
+	}
+}
+
+type fleetCloser interface {
+	Close() error
+}
+
+// cleanupManagedFleet releases managed workers even when an earlier cleanup step fails.
+func cleanupManagedFleet(manager fleet.FleetManager, timeout time.Duration) error {
+	var cleanupErrors []error
+	scaleCtx, cancelScale := context.WithTimeout(context.Background(), timeout)
+	if err := manager.Scale(scaleCtx, 0); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("scale managed workers to zero: %w", err))
+	}
+	cancelScale()
+
+	teardownCtx, cancelTeardown := context.WithTimeout(context.Background(), timeout)
+	if err := manager.Teardown(teardownCtx); err != nil {
+		cleanupErrors = append(cleanupErrors, fmt.Errorf("teardown managed workers: %w", err))
+	}
+	cancelTeardown()
+	if closer, ok := manager.(fleetCloser); ok {
+		if err := closer.Close(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("close managed fleet driver: %w", err))
+		}
+	}
+	return errors.Join(cleanupErrors...)
+}
+
 func parseOptions(args []string) (cliOptions, error) {
 	flags := flag.NewFlagSet("orchestrator", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	address := flags.String("addr", ":9090", "gRPC listen address")
 	metricsAddress := flags.String("metrics-addr", ":9091", "metrics and health listen address")
 	configPath := flags.String("config", "", "path to the load-test YAML file")
+	fleetDriverName := flags.String("fleet-driver", string(fleetDriverManual), "worker fleet driver (manual or docker)")
+	startupTimeout := flags.Duration("worker-startup-timeout", workerStartupTimeout, "maximum time for managed workers to register")
+	workerImage := flags.String("worker-image", "load-tester-worker:latest", "managed worker container image")
+	dockerNetwork := flags.String("docker-network", "bridge", "Docker network for managed workers")
+	workerOrchestratorAddress := flags.String("worker-orchestrator-addr", "host.docker.internal:9090", "orchestrator address used by managed workers")
+	dockerAddHostGateway := flags.Bool("docker-add-host-gateway", false, "add host.docker.internal host-gateway mapping to managed workers")
+	dockerWorkerCPUs := flags.Float64("docker-worker-cpus", 0, "per-worker Docker CPU limit; zero is unlimited")
 	if err := flags.Parse(args); err != nil {
 		return cliOptions{}, err
 	}
@@ -102,7 +215,28 @@ func parseOptions(args []string) (cliOptions, error) {
 	if *configPath == "" {
 		return cliOptions{}, errors.New("-config is required")
 	}
-	return cliOptions{address: *address, metricsAddress: *metricsAddress, configPath: *configPath}, nil
+	driver := fleetDriver(*fleetDriverName)
+	if driver != fleetDriverManual && driver != fleetDriverDocker {
+		return cliOptions{}, fmt.Errorf("unknown fleet driver %q", *fleetDriverName)
+	}
+	if *startupTimeout <= 0 {
+		return cliOptions{}, errors.New("-worker-startup-timeout must be greater than zero")
+	}
+	if err := docker.ValidateWorkerCPUs(*dockerWorkerCPUs); err != nil {
+		return cliOptions{}, fmt.Errorf("-docker-worker-cpus: %w", err)
+	}
+	return cliOptions{
+		address:                   *address,
+		metricsAddress:            *metricsAddress,
+		configPath:                *configPath,
+		fleetDriver:               driver,
+		workerStartupTimeout:      *startupTimeout,
+		workerImage:               *workerImage,
+		dockerNetwork:             *dockerNetwork,
+		workerOrchestratorAddress: *workerOrchestratorAddress,
+		dockerAddHostGateway:      *dockerAddHostGateway,
+		dockerWorkerCPUs:          *dockerWorkerCPUs,
+	}, nil
 }
 
 func newHTTPHandler(source metrics.PrometheusSource, info metrics.RunInfo) http.Handler {
@@ -149,14 +283,31 @@ func run(
 	runID string,
 	logger *log.Logger,
 ) (report.Summary, error) {
-	grpcListener, err := net.Listen("tcp", address)
+	return runWithOptions(ctx, cliOptions{
+		address:              address,
+		metricsAddress:       metricsAddress,
+		fleetDriver:          fleetDriverManual,
+		workerStartupTimeout: workerStartupTimeout,
+	}, cfg, runID, logger, newDockerFleetManager, newManagedController)
+}
+
+func runWithOptions(
+	ctx context.Context,
+	options cliOptions,
+	cfg loadconfig.Config,
+	runID string,
+	logger *log.Logger,
+	newDockerFleet dockerFleetFactory,
+	newController managedControllerFactory,
+) (report.Summary, error) {
+	grpcListener, err := net.Listen("tcp", options.address)
 	if err != nil {
-		return report.Summary{}, fmt.Errorf("listen on %s: %w", address, err)
+		return report.Summary{}, fmt.Errorf("listen on %s: %w", options.address, err)
 	}
 	defer grpcListener.Close()
-	metricsListener, err := net.Listen("tcp", metricsAddress)
+	metricsListener, err := net.Listen("tcp", options.metricsAddress)
 	if err != nil {
-		return report.Summary{}, fmt.Errorf("listen metrics on %s: %w", metricsAddress, err)
+		return report.Summary{}, fmt.Errorf("listen metrics on %s: %w", options.metricsAddress, err)
 	}
 	defer metricsListener.Close()
 
@@ -191,18 +342,118 @@ func run(
 		grpcListener.Addr(), metricsListener.Addr(), runID, cfg.Fleet.MinWorkers,
 	)
 	events := make(chan lifecycleEvent, 4)
+	if options.fleetDriver == fleetDriverManual {
+		go waitForResult(runCtx, control, events)
+		go waitForCancellation(runCtx, events)
+		return serveRun(cancel, grpcServer, httpServer, grpcListener, metricsListener, events, httpShutdownPeriod)
+	}
+
+	grpcReadyListener, grpcReady := newReadinessListener(grpcListener)
+	metricsReadyListener, metricsReady := newReadinessListener(metricsListener)
+	startServers(grpcServer, httpServer, grpcReadyListener, metricsReadyListener, events)
+	if err := waitForListeners(runCtx, grpcReady, metricsReady, events); err != nil {
+		return report.Summary{}, finishManagedSetupFailure(err, cancel, grpcServer, httpServer, nil)
+	}
+
+	manager, err := newFleetManager(runCtx, options, runID, newDockerFleet)
+	if err != nil {
+		return report.Summary{}, finishManagedSetupFailure(err, cancel, grpcServer, httpServer, nil)
+	}
+	controller, err := newController(manager, control, cfg, options, logger)
+	if err != nil {
+		return report.Summary{}, finishManagedSetupFailure(err, cancel, grpcServer, httpServer, manager)
+	}
+	control.SetAutoscalerMetricsSource(controller)
+	if err := controller.Prepare(runCtx); err != nil {
+		return report.Summary{}, finishManagedSetupFailure(fmt.Errorf("prepare managed worker fleet: %w", err), cancel, grpcServer, httpServer, manager)
+	}
+
 	go func() {
-		summary, err := control.WaitForResult(runCtx, metricsGracePeriod)
-		events <- lifecycleEvent{
-			kind:   lifecycleResult,
-			result: runResult{summary: summary, err: err},
+		waitForResult(runCtx, control, events)
+	}()
+	go waitForCancellation(runCtx, events)
+	controllerDone := make(chan struct{})
+	go func() {
+		defer close(controllerDone)
+		runManagedController(runCtx, control, controller, logger)
+	}()
+
+	summary, lifecycleErr := coordinateLifecycle(events, cancel, grpcServer, httpServer, httpShutdownPeriod)
+	<-controllerDone
+	cleanupErr := cleanupManagedFleet(manager, fleetCleanupPeriod)
+	return summary, errors.Join(lifecycleErr, cleanupErr)
+}
+
+func newDockerFleetManager(ctx context.Context, options docker.Options) (fleet.FleetManager, error) {
+	return docker.New(ctx, options)
+}
+
+func newManagedController(
+	manager fleet.FleetManager,
+	control *orchestrator.Server,
+	cfg loadconfig.Config,
+	options cliOptions,
+	logger *log.Logger,
+) (managedController, error) {
+	return autoscale.NewController(manager, control, autoscale.ControllerOptions{
+		Autoscale:        cfg.Fleet.Autoscale,
+		MinWorkers:       cfg.Fleet.MinWorkers,
+		MaxWorkers:       cfg.Fleet.MaxWorkers,
+		TargetRate:       cfg.Load.Rate,
+		RampUp:           cfg.Load.RampUp,
+		StartupTimeout:   options.workerStartupTimeout,
+		EvaluationPeriod: 5 * time.Second,
+		ObservationDelay: metricsDeliveryDelay,
+		Policy: autoscale.PolicyConfig{
+			Threshold:           0.9,
+			RequiredDeficits:    2,
+			Cooldown:            15 * time.Second,
+			MaximumGrowthFactor: 2,
+			MaxWorkers:          cfg.Fleet.MaxWorkers,
+		},
+	}, logger)
+}
+
+func waitForResult(ctx context.Context, control *orchestrator.Server, events chan<- lifecycleEvent) {
+	summary, err := control.WaitForResult(ctx, metricsGracePeriod)
+	events <- lifecycleEvent{
+		kind:   lifecycleResult,
+		result: runResult{summary: summary, err: err},
+	}
+}
+
+func waitForCancellation(ctx context.Context, events chan<- lifecycleEvent) {
+	<-ctx.Done()
+	events <- lifecycleEvent{kind: lifecycleCanceled}
+}
+
+func runManagedController(ctx context.Context, control runWindowSource, controller managedController, logger *log.Logger) {
+	window, err := control.WaitForRunWindow(ctx)
+	if err != nil {
+		if ctx.Err() == nil {
+			control.RecordInfrastructureViolation(fmt.Sprintf("wait for autoscale run window: %v", err))
 		}
-	}()
-	go func() {
-		<-runCtx.Done()
-		events <- lifecycleEvent{kind: lifecycleCanceled}
-	}()
-	return serveRun(cancel, grpcServer, httpServer, grpcListener, metricsListener, events, httpShutdownPeriod)
+		return
+	}
+	err = controller.Run(ctx, autoscale.RunWindow{StartsAt: window.StartsAt, Deadline: window.Deadline})
+	if err != nil && ctx.Err() == nil {
+		control.RecordInfrastructureViolation(fmt.Sprintf("run autoscale controller: %v", err))
+		logger.Printf("autoscale controller error: %v", err)
+	}
+}
+
+func finishManagedSetupFailure(
+	setupErr error,
+	cancel context.CancelFunc,
+	grpcServer grpcServeStopper,
+	httpServer httpServeShutdowner,
+	manager fleet.FleetManager,
+) error {
+	serverErr := stopServers(cancel, grpcServer, httpServer, httpShutdownPeriod)
+	if manager == nil {
+		return errors.Join(setupErr, serverErr)
+	}
+	return errors.Join(setupErr, serverErr, cleanupManagedFleet(manager, fleetCleanupPeriod))
 }
 
 type grpcServeStopper interface {
@@ -245,13 +496,61 @@ func serveRun(
 	events chan lifecycleEvent,
 	shutdownPeriod time.Duration,
 ) (report.Summary, error) {
+	startServers(grpcServer, httpServer, grpcListener, httpListener, events)
+	return coordinateLifecycle(events, cancel, grpcServer, httpServer, shutdownPeriod)
+}
+
+func startServers(
+	grpcServer grpcServeStopper,
+	httpServer httpServeShutdowner,
+	grpcListener net.Listener,
+	httpListener net.Listener,
+	events chan<- lifecycleEvent,
+) {
 	go func() {
 		events <- lifecycleEvent{kind: lifecycleGRPCStopped, err: grpcServer.Serve(grpcListener)}
 	}()
 	go func() {
 		events <- lifecycleEvent{kind: lifecycleHTTPStopped, err: httpServer.Serve(httpListener)}
 	}()
-	return coordinateLifecycle(events, cancel, grpcServer, httpServer, shutdownPeriod)
+}
+
+type readinessListener struct {
+	net.Listener
+	ready chan struct{}
+	once  sync.Once
+}
+
+func newReadinessListener(listener net.Listener) (*readinessListener, <-chan struct{}) {
+	ready := make(chan struct{})
+	return &readinessListener{Listener: listener, ready: ready}, ready
+}
+
+func (l *readinessListener) Accept() (net.Conn, error) {
+	l.once.Do(func() { close(l.ready) })
+	return l.Listener.Accept()
+}
+
+func waitForListeners(
+	ctx context.Context,
+	grpcReady, httpReady <-chan struct{},
+	events <-chan lifecycleEvent,
+) error {
+	for _, ready := range []<-chan struct{}{grpcReady, httpReady} {
+		select {
+		case <-ready:
+		case event := <-events:
+			switch event.kind {
+			case lifecycleGRPCStopped, lifecycleHTTPStopped:
+				return earlyServeError(serveResultFromEvent(event))
+			default:
+				return fmt.Errorf("unexpected lifecycle event %d before listener readiness", event.kind)
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 func coordinateLifecycle(

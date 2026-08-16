@@ -262,6 +262,193 @@ func TestCollectorCountsUnmetDemandOutsideRequestFailures(t *testing.T) {
 	assertCounter(t, "Failed", snapshot.Failed, 0)
 }
 
+func TestCollectorCountsAdmittedArrivalsBeforeRequestsComplete(t *testing.T) {
+	t.Parallel()
+
+	collector, err := NewCollector(1)
+	if err != nil {
+		t.Fatalf("NewCollector() error = %v", err)
+	}
+	if !collector.OfferAdmittedArrival() {
+		t.Fatal("OfferAdmittedArrival() = false, want accepted arrival")
+	}
+
+	snapshot := collector.Close()
+	assertCounter(t, "AdmittedArrivals", snapshot.AdmittedArrivals, 1)
+	assertCounter(t, "Requests", snapshot.Requests, 0)
+}
+
+func TestCollectorKeepsArrivalCountersWhenResultBufferIsFull(t *testing.T) {
+	t.Parallel()
+
+	collector, err := NewCollector(1)
+	if err != nil {
+		t.Fatalf("NewCollector() error = %v", err)
+	}
+
+	const arrivals = 100_000
+	for range arrivals {
+		collector.Offer(protocol.Result{Latency: time.Millisecond, StatusCode: 200})
+		if !collector.OfferAdmittedArrival() {
+			t.Fatal("OfferAdmittedArrival() = false before Close()")
+		}
+		if !collector.OfferUnmetDemand() {
+			t.Fatal("OfferUnmetDemand() = false before Close()")
+		}
+	}
+
+	snapshot := collector.Close()
+	if snapshot.DroppedSamples == 0 {
+		t.Fatal("DroppedSamples = 0, want result-buffer pressure")
+	}
+	assertCounter(t, "AdmittedArrivals", snapshot.AdmittedArrivals, arrivals)
+	assertCounter(t, "UnmetDemand", snapshot.UnmetDemand, arrivals)
+}
+
+func TestCollectorResetsArrivalCountersAtSnapshotBoundary(t *testing.T) {
+	t.Parallel()
+
+	collector, err := NewCollector(1)
+	if err != nil {
+		t.Fatalf("NewCollector() error = %v", err)
+	}
+	collector.OfferAdmittedArrival()
+	collector.OfferAdmittedArrival()
+	collector.OfferUnmetDemand()
+	first := collector.SnapshotAndReset()
+
+	collector.OfferAdmittedArrival()
+	collector.OfferUnmetDemand()
+	collector.OfferUnmetDemand()
+	second := collector.Close()
+
+	assertCounter(t, "first.AdmittedArrivals", first.AdmittedArrivals, 2)
+	assertCounter(t, "first.UnmetDemand", first.UnmetDemand, 1)
+	assertCounter(t, "second.AdmittedArrivals", second.AdmittedArrivals, 1)
+	assertCounter(t, "second.UnmetDemand", second.UnmetDemand, 2)
+}
+
+func TestSnapshotAndResetLinearizesArrivalCountersBeforeWaitingForFullResultQueue(t *testing.T) {
+	collector := &Collector{events: make(chan event, 1)}
+	blockedReply := make(chan Snapshot)
+	collector.events <- event{kind: snapshotEvent, reply: blockedReply}
+	go collector.run()
+
+	deadline := time.Now().Add(time.Second)
+	for len(collector.events) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("collector did not begin the blocking snapshot event")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !collector.Offer(protocol.Result{Latency: time.Millisecond, StatusCode: 200}) {
+		t.Fatal("Offer() did not fill the result queue")
+	}
+
+	arrivalGeneration := collector.currentArrivalCounters()
+	firstReady := make(chan Snapshot, 1)
+	go func() {
+		firstReady <- collector.SnapshotAndReset()
+	}()
+	for collector.arrivals.Load() == arrivalGeneration {
+		if time.Now().After(deadline) {
+			t.Fatal("SnapshotAndReset() did not rotate arrival counters")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if !collector.OfferAdmittedArrival() || !collector.OfferUnmetDemand() {
+		t.Fatal("arrival counters were rejected while the snapshot waited for queue space")
+	}
+	<-blockedReply
+	first := <-firstReady
+	second := collector.Close()
+
+	assertCounter(t, "first.AdmittedArrivals", first.AdmittedArrivals, 0)
+	assertCounter(t, "first.UnmetDemand", first.UnmetDemand, 0)
+	assertCounter(t, "second.AdmittedArrivals", second.AdmittedArrivals, 1)
+	assertCounter(t, "second.UnmetDemand", second.UnmetDemand, 1)
+}
+
+func TestSnapshotAndResetLinearizesDroppedSamplesBeforeWaitingForFullResultQueue(t *testing.T) {
+	collector := &Collector{events: make(chan event, 1)}
+	blockedReply := make(chan Snapshot)
+	collector.events <- event{kind: snapshotEvent, reply: blockedReply}
+	go collector.run()
+
+	deadline := time.Now().Add(time.Second)
+	for len(collector.events) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("collector did not begin the blocking snapshot event")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !collector.Offer(protocol.Result{Latency: time.Millisecond, StatusCode: 200}) {
+		t.Fatal("Offer() did not fill the result queue")
+	}
+
+	arrivalGeneration := collector.currentArrivalCounters()
+	firstReady := make(chan Snapshot, 1)
+	go func() {
+		firstReady <- collector.SnapshotAndReset()
+	}()
+	for collector.arrivals.Load() == arrivalGeneration {
+		if time.Now().After(deadline) {
+			t.Fatal("SnapshotAndReset() did not rotate arrival counters")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if collector.Offer(protocol.Result{Latency: time.Millisecond, StatusCode: 503}) {
+		t.Fatal("Offer() accepted a result despite the full queue")
+	}
+	<-blockedReply
+	first := <-firstReady
+	second := collector.Close()
+
+	assertCounter(t, "first.DroppedSamples", first.DroppedSamples, 0)
+	assertCounter(t, "second.DroppedSamples", second.DroppedSamples, 1)
+}
+
+func TestCollectorPreservesArrivalCountsAcrossConcurrentSnapshots(t *testing.T) {
+	collector, err := NewCollector(8)
+	if err != nil {
+		t.Fatalf("NewCollector() error = %v", err)
+	}
+
+	const (
+		producers   = 8
+		perProducer = 2_000
+	)
+	var producersDone sync.WaitGroup
+	producersDone.Add(producers)
+	for range producers {
+		go func() {
+			defer producersDone.Done()
+			for range perProducer {
+				if !collector.OfferAdmittedArrival() || !collector.OfferUnmetDemand() {
+					t.Error("arrival counter rejected before Close()")
+					return
+				}
+			}
+		}()
+	}
+
+	var admitted, unmet uint64
+	for range 32 {
+		snapshot := collector.SnapshotAndReset()
+		admitted += snapshot.AdmittedArrivals
+		unmet += snapshot.UnmetDemand
+	}
+	producersDone.Wait()
+	final := collector.Close()
+	admitted += final.AdmittedArrivals
+	unmet += final.UnmetDemand
+
+	assertCounter(t, "AdmittedArrivals", admitted, producers*perProducer)
+	assertCounter(t, "UnmetDemand", unmet, producers*perProducer)
+}
+
 func assertCounter(t *testing.T, name string, got, want uint64) {
 	t.Helper()
 

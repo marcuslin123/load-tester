@@ -14,6 +14,7 @@ import (
 	"github.com/marcuslin123/load-tester/internal/config"
 	"github.com/marcuslin123/load-tester/internal/loadgen"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 type assignmentReceiveResult struct {
@@ -59,6 +60,8 @@ func TestCoordinatorWaitsForMinimumWorkersAndAssignsEqualSlices(t *testing.T) {
 
 	assertAssignment(t, firstAssignment, "test-run", 1, 50, now.Add(time.Second), now.Add(31*time.Second))
 	assertAssignment(t, secondAssignment, "test-run", 1, 50, now.Add(time.Second), now.Add(31*time.Second))
+	assertActivation(t, firstAssignment, now.Add(time.Second))
+	assertActivation(t, secondAssignment, now.Add(time.Second))
 }
 
 func TestCoordinatorRebalancesJoinWithoutExtendingRunWindow(t *testing.T) {
@@ -84,6 +87,10 @@ func TestCoordinatorRebalancesJoinWithoutExtendingRunWindow(t *testing.T) {
 	assertAssignment(t, revisionTwoFirst, "test-run", 2, 34, initial.Add(time.Second), initial.Add(31*time.Second))
 	assertAssignment(t, revisionTwoSecond, "test-run", 2, 33, initial.Add(time.Second), initial.Add(31*time.Second))
 	assertAssignment(t, revisionTwoThird, "test-run", 2, 33, initial.Add(time.Second), initial.Add(31*time.Second))
+	activation := initial.Add(11 * time.Second)
+	assertActivation(t, revisionTwoFirst, activation)
+	assertActivation(t, revisionTwoSecond, activation)
+	assertActivation(t, revisionTwoThird, activation)
 }
 
 func TestCoordinatorRebalancesDepartureBelowMinimumWorkers(t *testing.T) {
@@ -105,6 +112,7 @@ func TestCoordinatorRebalancesDepartureBelowMinimumWorkers(t *testing.T) {
 
 	rebalanced := receiveAssignment(t, first)
 	assertAssignment(t, rebalanced, "test-run", 2, 100, initial.Add(time.Second), initial.Add(31*time.Second))
+	assertActivation(t, rebalanced, initial.Add(3*time.Second))
 	if violations := server.metrics.Violations(); !containsViolation(violations, "worker-b failed") {
 		t.Fatalf("violations = %v, want active worker-b failure", violations)
 	}
@@ -192,8 +200,10 @@ func TestCoordinatorKeepsRunOpenForReplacementAfterFleetLoss(t *testing.T) {
 	if got := recovered.GetDeadline().AsTime(); !got.Equal(initial.Add(31 * time.Second)) {
 		t.Fatalf("replacement deadline = %v, want original deadline", got)
 	}
+	activation := recoveryTime.Add(time.Second)
+	assertActivation(t, recovered, activation)
 
-	wantUnmet := loadgen.ScheduledArrivalsBetween(initial.Add(time.Second), failureTime, recoveryTime, 5, 0) * 2
+	wantUnmet := loadgen.ScheduledArrivalsBetween(initial.Add(time.Second), failureTime, activation, 5, 0) * 2
 	if got := waitForUnmetDemand(server, wantUnmet); got != wantUnmet {
 		t.Fatalf(
 			"recovery unmet demand = %d, want %d; workers=%+v violations=%v logs=%s",
@@ -203,6 +213,10 @@ func TestCoordinatorKeepsRunOpenForReplacementAfterFleetLoss(t *testing.T) {
 			server.metrics.Violations(),
 			logs.String(),
 		)
+	}
+	window := server.ArrivalWindow(initial.Add(time.Second), initial.Add(6*time.Second))
+	if window.Unmet != wantUnmet {
+		t.Fatalf("recovery unmet demand in exact arrival window = %d, want %d", window.Unmet, wantUnmet)
 	}
 }
 
@@ -323,6 +337,68 @@ func TestCoordinatorRequiresCompleteOpenCapacityForRecovery(t *testing.T) {
 	})
 	if !coordinator.restoresConfiguredCapacity(complete) {
 		t.Fatal("complete capacity did not restore recovery")
+	}
+}
+
+func TestCoordinatorUsesActiveDeliveryWhenWorkerFailsBeforePendingActivation(t *testing.T) {
+	startsAt := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	coordinator := &assignmentCoordinator{}
+	active := &loadtestv1.LoadAssignment{
+		Revision: 1,
+		Load: &loadtestv1.LoadSlice{
+			Model: loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE,
+			Rate:  10,
+		},
+		ActivatesAt: timestamppb.New(startsAt),
+	}
+	pending := &loadtestv1.LoadAssignment{
+		Revision: 2,
+		Load: &loadtestv1.LoadSlice{
+			Model: loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE,
+			Rate:  5,
+		},
+		ActivatesAt: timestamppb.New(startsAt.Add(5 * time.Second)),
+	}
+	coordinator.recordDelivered("worker-a", active)
+	coordinator.recordDelivered("worker-a", pending)
+
+	got := coordinator.activeDeliveryAt("worker-a", startsAt.Add(4*time.Second))
+	if got == nil || got.GetRevision() != 1 || got.GetLoad().GetRate() != 10 {
+		t.Fatalf("active delivery = %v, want revision 1 at rate 10", got)
+	}
+	got = coordinator.activeDeliveryAt("worker-a", startsAt.Add(5*time.Second))
+	if got == nil || got.GetRevision() != 2 || got.GetLoad().GetRate() != 5 {
+		t.Fatalf("delivery at activation = %v, want revision 2 at rate 5", got)
+	}
+}
+
+func TestCoordinatorReopensRecoveryWhenProviderFailsBeforeActivation(t *testing.T) {
+	activation := time.Date(2026, time.August, 15, 12, 0, 5, 0, time.UTC)
+	coordinator := &assignmentCoordinator{
+		recovery: make(map[string]workerRecovery),
+		restorations: []capacityRestoration{{
+			activatesAt: activation,
+			providers:   map[string]struct{}{"worker-a": {}},
+			recovered: map[string]*loadtestv1.LoadSlice{
+				"worker-b": {
+					Model: loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE,
+					Rate:  5,
+				},
+			},
+		}},
+	}
+
+	coordinator.invalidateRestorations("worker-a", activation.Add(-time.Second))
+
+	recovery, ok := coordinator.recovery["worker-b"]
+	if !ok {
+		t.Fatal("worker-b recovery was not reopened")
+	}
+	if !recovery.detected.Equal(activation) || recovery.load.GetRate() != 5 {
+		t.Fatalf("reopened recovery = %+v, want activation boundary at rate 5", recovery)
+	}
+	if !coordinator.restorations[0].invalidated {
+		t.Fatal("restoration remains valid after its only provider failed before activation")
 	}
 }
 
@@ -456,5 +532,15 @@ func assertAssignment(
 	}
 	if got := assignment.GetTarget().GetHttp().GetUrl(); got != "http://target:8080/work" {
 		t.Errorf("target URL = %q, want http://target:8080/work", got)
+	}
+}
+
+func assertActivation(t *testing.T, assignment *loadtestv1.LoadAssignment, want time.Time) {
+	t.Helper()
+	if assignment.GetActivatesAt() == nil {
+		t.Fatal("activation time is nil")
+	}
+	if got := assignment.GetActivatesAt().AsTime(); !got.Equal(want) {
+		t.Errorf("activates at = %v, want %v", got, want)
 	}
 }

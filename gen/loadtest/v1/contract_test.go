@@ -36,6 +36,7 @@ func TestEnvelopeMessagesRoundTrip(t *testing.T) {
 	t.Parallel()
 
 	started := timestamppb.New(time.Unix(1_700_000_000, 0))
+	activation := timestamppb.New(time.Unix(1_700_000_010, 0))
 	deadline := timestamppb.New(time.Unix(1_700_000_060, 0))
 	tests := []struct {
 		name    string
@@ -64,14 +65,15 @@ func TestEnvelopeMessagesRoundTrip(t *testing.T) {
 					IntervalStart:      started,
 					IntervalEnd:        deadline,
 					Counters: &loadtestv1.MetricCounters{
-						Requests:       100,
-						Succeeded:      90,
-						Failed:         10,
-						ServerErrors:   10,
-						BytesRead:      4096,
-						DroppedSamples: 2,
-						UnmetDemand:    4,
-						StatusCodes:    map[int32]uint64{200: 90, 503: 10},
+						Requests:         100,
+						Succeeded:        90,
+						Failed:           10,
+						ServerErrors:     10,
+						BytesRead:        4096,
+						DroppedSamples:   2,
+						UnmetDemand:      4,
+						StatusCodes:      map[int32]uint64{200: 90, 503: 10},
+						AdmittedArrivals: 96,
 					},
 					HistogramEncoding: loadtestv1.HistogramEncoding_HISTOGRAM_ENCODING_HDR_V2_COMPRESSED,
 					LatencyHistogram:  []byte{0x01, 0x02, 0x03},
@@ -119,13 +121,17 @@ func TestEnvelopeMessagesRoundTrip(t *testing.T) {
 						},
 					}},
 					Load: &loadtestv1.LoadSlice{
-						Model:       loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE,
-						Rate:        500,
-						MaxInFlight: 1_000,
-						RampUp:      durationpb.New(10 * time.Second),
+						Model:              loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE,
+						Rate:               500,
+						MaxInFlight:        1_000,
+						RampUp:             durationpb.New(10 * time.Second),
+						GlobalRate:         1_000,
+						ScheduleShardIndex: 1,
+						ScheduleShardCount: 2,
 					},
-					StartsAt: started,
-					Deadline: deadline,
+					StartsAt:    started,
+					Deadline:    deadline,
+					ActivatesAt: activation,
 				},
 			}},
 			new: func() proto.Message { return &loadtestv1.OrchestratorMessage{} },
@@ -180,6 +186,14 @@ func TestWireFieldNumbersRemainStable(t *testing.T) {
 			message: (&loadtestv1.LoadAssignment{}).ProtoReflect().Descriptor(),
 			fields: map[string]protoreflect.FieldNumber{
 				"run_id": 1, "revision": 2, "target": 3, "load": 4, "starts_at": 5, "deadline": 6,
+				"activates_at": 7,
+			},
+		},
+		{
+			message: (&loadtestv1.LoadSlice{}).ProtoReflect().Descriptor(),
+			fields: map[string]protoreflect.FieldNumber{
+				"model": 1, "virtual_users": 2, "rate": 3, "max_in_flight": 4, "ramp_up": 5,
+				"global_rate": 6, "schedule_shard_index": 7, "schedule_shard_count": 8,
 			},
 		},
 		{
@@ -188,6 +202,14 @@ func TestWireFieldNumbersRemainStable(t *testing.T) {
 				"worker_id": 1, "run_id": 2, "assignment_revision": 3, "sequence": 4,
 				"interval_start": 5, "interval_end": 6, "counters": 7,
 				"histogram_encoding": 8, "latency_histogram": 9,
+			},
+		},
+		{
+			message: (&loadtestv1.MetricCounters{}).ProtoReflect().Descriptor(),
+			fields: map[string]protoreflect.FieldNumber{
+				"requests": 1, "succeeded": 2, "failed": 3, "transport_errors": 4,
+				"client_errors": 5, "server_errors": 6, "bytes_read": 7, "dropped_samples": 8,
+				"unmet_demand": 9, "status_codes": 10, "admitted_arrivals": 11,
 			},
 		},
 	}
@@ -203,6 +225,20 @@ func TestWireFieldNumbersRemainStable(t *testing.T) {
 				t.Errorf("%s.%s field number = %d, want %d", test.message.FullName(), name, got, want)
 			}
 		}
+	}
+}
+
+func TestMetricCountersDecodeLegacyPayloadWithoutAdmittedArrivals(t *testing.T) {
+	t.Parallel()
+
+	// Fields 1 and 9 predate admitted_arrivals at field 11.
+	legacy := []byte{0x08, 0x07, 0x48, 0x02}
+	var counters loadtestv1.MetricCounters
+	if err := proto.Unmarshal(legacy, &counters); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if counters.GetRequests() != 7 || counters.GetUnmetDemand() != 2 || counters.GetAdmittedArrivals() != 0 {
+		t.Fatalf("legacy counters = %+v, want requests=7 unmet=2 admitted=0", &counters)
 	}
 }
 
@@ -248,7 +284,7 @@ func TestMetricsPayloadPreservesMapAndHistogramBytes(t *testing.T) {
 	wantCodes := map[int32]uint64{200: 90, 503: 10}
 	wantHistogram := []byte{0xde, 0xad, 0xbe, 0xef}
 	want := &loadtestv1.MetricsDelta{
-		Counters:         &loadtestv1.MetricCounters{StatusCodes: wantCodes},
+		Counters:         &loadtestv1.MetricCounters{StatusCodes: wantCodes, AdmittedArrivals: 17},
 		LatencyHistogram: wantHistogram,
 	}
 	encoded, err := proto.Marshal(want)
@@ -265,5 +301,8 @@ func TestMetricsPayloadPreservesMapAndHistogramBytes(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.GetLatencyHistogram(), wantHistogram) {
 		t.Errorf("histogram bytes = %x, want %x", got.GetLatencyHistogram(), wantHistogram)
+	}
+	if got.GetCounters().GetAdmittedArrivals() != 17 {
+		t.Errorf("admitted arrivals = %d, want 17", got.GetCounters().GetAdmittedArrivals())
 	}
 }

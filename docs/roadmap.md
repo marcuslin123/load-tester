@@ -430,12 +430,14 @@ with `docker ps`.
 
 `Teardown` leaving nothing behind is worth being strict about — orphaned
 containers on a laptop are an annoyance, but the same bug against AWS is a bill.
+Scale-to-zero and teardown receive independent bounded cleanup contexts before
+provider resources are closed, so one timed-out attempt cannot suppress the next.
 
-**Design decisions:** The provider-neutral interface exposes `Scale`, `List`, and
-`Teardown`; the Docker implementation uses the official Go SDK through a narrow
-client interface. The driver owns only run-labeled worker containers and attaches
-them to a caller-owned network. Desired counts refer to exactly that many running
-containers, using deterministic numbered worker slots and highest-slot-first
+**Design decisions:** The provider-neutral interface exposes `Scale`, `Replace`,
+`List`, and `Teardown`; the Docker implementation uses the official Go SDK
+through a narrow client interface. The driver owns only run-labeled worker
+containers and attaches them to a caller-owned network. Desired counts refer to
+exactly that many running containers, using deterministic numbered worker slots and highest-slot-first
 scale-down. Stopped slots are visible through `List` and replaced only when
 `Scale` is called. Docker running state is the `Scale` contract; worker gRPC
 registration is verified separately by the orchestrator. Scale-up rolls back new
@@ -520,17 +522,18 @@ Corresponds to spec §12, Week 4.
 
 ### Piece 19 — Autoscaler control loop
 
-**Goal:** `internal/autoscale` — the loop from spec §6: measure achieved versus
-assigned rate, scale by the deficit ratio, respect a cooldown, rebalance on
-membership change.
+**Goal:** `internal/autoscale` — the loop from spec §6: measure scheduler
+coverage against the exact ramp schedule, scale by the deficit ratio, respect a
+cooldown, and rebalance on membership change.
 
 **Why here:** It needs a working fleet driver (Piece 16) and trustworthy
 throughput measurements (Piece 13) to act on.
 
 **Done when:** Table-driven tests over synthetic saturation inputs produce the
 expected decisions, including no-scale inside the cooldown window and no scale
-past `max_workers`. Live against Docker, an under-provisioned run scales up and
-converges on the target rate.
+past `max_workers`. Live against Docker, a reproducibly CPU-limited,
+under-provisioned run scales up, recovers scheduler coverage, and tears down all
+managed containers.
 
 **Teaches:** Control loops, hysteresis and thrash avoidance, testing
 time-dependent logic without sleeping.
@@ -539,6 +542,42 @@ Per-worker capacity is deliberately *measured* rather than assumed — it depend
 on instance size, target latency, and response size, so no constant would be
 right. Scaling by the deficit ratio rather than one worker at a time is what keeps
 convergence from taking minutes.
+
+**Design decisions:** Autoscaling is valid only for `constant-rate` and starts at
+`min_workers`. Every five seconds, expected arrivals come from the absolute ramp
+schedule. Workers partition one global sequence rather than creating independent
+local schedules, preserving exact deadlines across uneven rate splits. After a
+three-second delivery allowance, the controller reads metric intervals only
+through the logical boundary. Exact admitted and unmet counts distinguish generated load,
+max-in-flight rejection, and scheduler lag. Two consecutive intervals below 90%
+scheduler coverage trigger a deficit-ratio increase capped at two times the
+current fleet and `max_workers`, followed by a 15-second cooldown. Replacement
+reconciliation takes priority over capacity growth. The controller does not
+scale down during a run because the supported profile only ramps upward and then
+remains constant; teardown scales directly to zero. Final evaluation derives
+total scheduler lag once from expected, admitted, and already-recorded unmet
+arrivals, so omitted load fails the run without feeding synthetic counters back
+into later control windows. A worker that falls behind skips stale intermediate
+deadlines instead of burst-catching up, preserving the configured arrival shape
+and preventing old admissions from inflating a later controller window.
+Over-generation also fails as an integrity violation. Revisions queue by
+activation time; each old revision stops scheduling on time while admitted
+requests drain through its own collector. Transport sequences remain ordered,
+but revision delivery may be out of order so current metrics do not wait behind
+a stalled request from an older revision.
+
+Driver selection is operational: manual mode preserves externally managed
+workers and rejects autoscaling, while Docker mode owns provisioning,
+replacement, and teardown. Initial provisioning or registration timeout is a
+setup failure. Mid-run driver errors become result violations and retry without
+cooldown. A previously registered but disconnected worker is replaced by stable
+provider ID even if its old container is still running, while a newly created
+worker receives the startup grace period. Unit tests use synthetic observations and fake time; the live Docker
+test applies an optional per-worker CPU limit so adding workers provides
+reproducible capacity rather than depending on the host being naturally
+saturated. Prometheus metrics and decision logs expose desired versus registered
+workers, expected versus admitted rate, scheduler coverage, deficit streaks,
+scale actions, and fleet errors.
 
 ### Piece 20 — Kubernetes fleet driver
 

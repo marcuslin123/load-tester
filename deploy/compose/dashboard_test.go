@@ -86,7 +86,7 @@ func TestDashboardDefinesRequiredPanelsAndQueries(t *testing.T) {
 	requiredQueries := map[string][]string{
 		"Current RPS":              {`rate(loadtester_requests_total[$__rate_interval])`},
 		"Current Error Rate":       {`sum(rate(loadtester_request_failures_total[$__rate_interval]))`, `clamp_min(sum(rate(loadtester_requests_total[$__rate_interval]))`, `, 1e-9)`},
-		"Active Workers":           {`loadtester_active_workers`},
+		"Active Workers":           {`loadtester_active_workers`, `loadtester_desired_workers`},
 		"Dropped Samples":          {`loadtester_dropped_samples_total`},
 		"Unmet Demand":             {`loadtester_unmet_demand_total`},
 		"Requests per Second":      {`rate(loadtester_requests_total[$__rate_interval])`},
@@ -95,6 +95,7 @@ func TestDashboardDefinesRequiredPanelsAndQueries(t *testing.T) {
 		"HTTP Status Codes":        {`sum by (code)`, `rate(loadtester_http_responses_total[$__rate_interval])`},
 		"Per-worker RPS":           {`sum by (worker_id)`, `rate(loadtester_worker_requests_total[$__rate_interval])`},
 		"Active Workers Over Time": {`loadtester_active_workers`},
+		"Scheduler Coverage":       {`loadtester_autoscaler_scheduler_coverage_ratio`},
 	}
 
 	panels := make(map[string]panel, len(dashboard.Panels))
@@ -122,9 +123,11 @@ func TestDashboardDefinesRequiredPanelsAndQueries(t *testing.T) {
 	assertPanelUnit(t, panels["Current Error Rate"], "percentunit")
 	assertPanelUnit(t, panels["Latency Percentiles"], "s")
 	assertPanelUnit(t, panels["Error Rate by Kind"], "percentunit")
+	assertPanelUnit(t, panels["Scheduler Coverage"], "percentunit")
 	assertStacked(t, panels["HTTP Status Codes"])
 	assertStacked(t, panels["Per-worker RPS"])
 	assertLatencyThreshold(t, panels["Latency Percentiles"], 0.1)
+	assertThreshold(t, panels["Scheduler Coverage"], 0.90)
 }
 
 func TestPrometheusDatasourceMatchesScrapeInterval(t *testing.T) {
@@ -226,6 +229,11 @@ func assertStacked(t *testing.T, panel panel) {
 }
 
 func assertLatencyThreshold(t *testing.T, panel panel, want float64) {
+	t.Helper()
+	assertThreshold(t, panel, want)
+}
+
+func assertThreshold(t *testing.T, panel panel, want float64) {
 	t.Helper()
 	for _, step := range panel.FieldConfig.Defaults.Thresholds.Steps {
 		if step.Value != nil && *step.Value == want {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	loadtestv1 "github.com/marcuslin123/load-tester/gen/loadtest/v1"
+	"github.com/marcuslin123/load-tester/internal/autoscale"
 	"github.com/marcuslin123/load-tester/internal/metrics"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -26,6 +27,11 @@ type Options struct {
 	HeartbeatInterval time.Duration
 	Logger            *log.Logger
 	Assignment        *AssignmentOptions
+}
+
+// AutoscalerMetricsSource supplies a race-free controller snapshot for scrapes.
+type AutoscalerMetricsSource interface {
+	AutoscalerMetrics() metrics.AutoscalerView
 }
 
 type serverDependencies struct {
@@ -89,6 +95,7 @@ type Server struct {
 
 	assignments *assignmentCoordinator
 	metrics     *metricsAggregator
+	autoscaler  AutoscalerMetricsSource
 }
 
 // NewServer creates a registration server with no active workers.
@@ -284,6 +291,26 @@ func (s *Server) FleetMetrics() metrics.Snapshot {
 	return s.metrics.Snapshot()
 }
 
+// ArrivalWindow consumes exact load-generation counters for one controller interval.
+func (s *Server) ArrivalWindow(from, to time.Time) autoscale.ArrivalWindow {
+	if s.metrics == nil {
+		return autoscale.ArrivalWindow{Complete: true}
+	}
+	window := s.metrics.ArrivalWindow(from, to)
+	return autoscale.ArrivalWindow{
+		Admitted: window.Admitted,
+		Unmet:    window.Unmet,
+		Complete: window.Complete,
+	}
+}
+
+// RecordInfrastructureViolation makes managed-fleet failures part of the final result.
+func (s *Server) RecordInfrastructureViolation(violation string) {
+	if s.metrics != nil {
+		s.metrics.RecordInfrastructureViolation(violation)
+	}
+}
+
 // ActiveWorkerIDs returns active worker IDs in deterministic order.
 func (s *Server) ActiveWorkerIDs() []string {
 	if s.metrics == nil {
@@ -297,6 +324,13 @@ func (s *Server) ActiveWorkerIDs() []string {
 	return workerIDs
 }
 
+// SetAutoscalerMetricsSource adds managed-fleet state to future Prometheus views.
+func (s *Server) SetAutoscalerMetricsSource(source AutoscalerMetricsSource) {
+	s.mu.Lock()
+	s.autoscaler = source
+	s.mu.Unlock()
+}
+
 // PrometheusView returns one immutable fleet, worker, and activity view.
 func (s *Server) PrometheusView() metrics.PrometheusView {
 	if s.metrics == nil {
@@ -308,8 +342,12 @@ func (s *Server) PrometheusView() metrics.PrometheusView {
 	for workerID := range s.sessions {
 		view.ActiveWorkerIDs = append(view.ActiveWorkerIDs, workerID)
 	}
+	autoscaler := s.autoscaler
 	s.mu.RUnlock()
 	slices.Sort(view.ActiveWorkerIDs)
+	if autoscaler != nil {
+		view.Autoscaler = autoscaler.AutoscalerMetrics()
+	}
 	return view
 }
 

@@ -19,6 +19,7 @@ func TestRunExcludesPreflightFromMetrics(t *testing.T) {
 	var calls atomic.Uint64
 	executor := protocolFunc(func(context.Context) protocol.Result {
 		calls.Add(1)
+		time.Sleep(100 * time.Microsecond)
 		return protocol.Result{Latency: time.Millisecond, StatusCode: 200}
 	})
 

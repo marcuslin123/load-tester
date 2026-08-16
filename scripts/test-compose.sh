@@ -233,7 +233,7 @@ grafana_dashboard_is_provisioned() {
   printf '%s\n' "$response" | jq -e '
     .dashboard.uid == "load-tester-overview" and
     .dashboard.title == "Load Tester Overview" and
-    (.dashboard.panels | length) == 11 and
+    (.dashboard.panels | length) == 12 and
     .meta.provisioned == true
   ' >/dev/null 2>&1
 }
@@ -316,7 +316,7 @@ while (( SECONDS < deadline )); do
     printf 'Prometheus worker-b series: PASS (%s)\n' "$WORKER_B_RESPONSE"
     printf 'Grafana health: PASS (%s)\n' "$GRAFANA_HEALTH_RESPONSE"
     printf 'Grafana datasource: PASS (%s)\n' "$GRAFANA_DATASOURCE_RESPONSE"
-    printf 'Grafana dashboard: PASS (uid=load-tester-overview panels=11 provisioned=true)\n'
+    printf 'Grafana dashboard: PASS (uid=load-tester-overview panels=12 provisioned=true)\n'
     printf 'Grafana dashboard queries: PASS (rps=p99=positive server-error=positive status-200=positive worker-a=positive worker-b=positive)\n'
     exit 0
   fi

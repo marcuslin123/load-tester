@@ -9,6 +9,7 @@ import (
 type stubManager struct{}
 
 func (stubManager) Scale(context.Context, int) error           { return nil }
+func (stubManager) Replace(context.Context, string) error      { return nil }
 func (stubManager) List(context.Context) ([]WorkerInfo, error) { return nil, nil }
 func (stubManager) Teardown(context.Context) error             { return nil }
 

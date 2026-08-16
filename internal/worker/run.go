@@ -26,8 +26,29 @@ type runControllerOptions struct {
 	MetricsBufferSize int
 	InitialSequence   uint64
 	Now               func() time.Time
-	StopScheduler     func(context.CancelFunc, <-chan error)
+	NewTimer          func(time.Time) controllerTimer
+	StartScheduler    func(*loadtestv1.LoadAssignment, *metrics.Collector) (context.CancelFunc, <-chan error, error)
 }
+
+type controllerTimer interface {
+	C() <-chan time.Time
+	Stop()
+}
+
+type realControllerTimer struct {
+	timer *time.Timer
+}
+
+func newRealControllerTimer(at time.Time) controllerTimer {
+	delay := time.Until(at)
+	if delay < 0 {
+		delay = 0
+	}
+	return &realControllerTimer{timer: time.NewTimer(delay)}
+}
+
+func (t *realControllerTimer) C() <-chan time.Time { return t.timer.C }
+func (t *realControllerTimer) Stop()               { t.timer.Stop() }
 
 type runStatus struct {
 	RunID      string
@@ -42,6 +63,30 @@ type runStatus struct {
 type applyRunCommand struct {
 	assignment *loadtestv1.LoadAssignment
 	reply      chan error
+}
+
+type metricEmission struct {
+	assignment    *loadtestv1.LoadAssignment
+	intervalStart time.Time
+	intervalEnd   time.Time
+	snapshot      metrics.Snapshot
+	final         bool
+	ready         bool
+}
+
+type revisionScheduler struct {
+	cancel    context.CancelFunc
+	done      <-chan error
+	collector *metrics.Collector
+	drained   chan struct{}
+	emission  *metricEmission
+	completed bool
+	snapshot  metrics.Snapshot
+}
+
+type revisionDrain struct {
+	scheduler *revisionScheduler
+	err       error
 }
 
 // runController serializes assignment transitions and metric boundaries for one
@@ -89,8 +134,8 @@ func newRunController(
 	if options.Now == nil {
 		options.Now = time.Now
 	}
-	if options.StopScheduler == nil {
-		options.StopScheduler = stopScheduler
+	if options.NewTimer == nil {
+		options.NewTimer = newRealControllerTimer
 	}
 	if options.ReportingInterval <= 0 {
 		return nil, errors.New("reporting interval must be greater than zero")
@@ -141,7 +186,7 @@ func (c *runController) Status() runStatus {
 	c.statusMu.RUnlock()
 	status.InFlight = c.inFlight.Load()
 	if status.activeLoad {
-		now := time.Now()
+		now := c.options.Now()
 		if !now.Before(status.StartsAt) && now.Before(status.Deadline) {
 			status.State = loadtestv1.WorkerState_WORKER_STATE_RUNNING
 		}
@@ -161,33 +206,172 @@ func (c *runController) Close() {
 func (c *runController) run() {
 	defer close(c.done)
 	var (
-		current         *loadtestv1.LoadAssignment
-		collector       *metrics.Collector
-		schedulerCancel context.CancelFunc
-		schedulerDone   <-chan error
-		intervalStart   time.Time
-		sequence        = c.options.InitialSequence - 1
-		timer           *time.Timer
-		timerC          <-chan time.Time
-		timerAt         time.Time
+		current       *loadtestv1.LoadAssignment
+		pending       []*loadtestv1.LoadAssignment
+		scheduler     *revisionScheduler
+		schedulers    []*revisionScheduler
+		emissions     []*metricEmission
+		intervalStart time.Time
+		metricAt      time.Time
+		sequence      = c.options.InitialSequence - 1
+		timer         controllerTimer
+		timerC        <-chan time.Time
+		timerAt       time.Time
 	)
+	drains := make(chan revisionDrain, 1)
 	defer func() {
-		stopTimer(timer)
-		c.options.StopScheduler(schedulerCancel, schedulerDone)
-		if collector != nil {
-			collector.Close()
+		stopControllerTimer(timer)
+		for _, running := range schedulers {
+			running.cancel()
+		}
+		for _, running := range schedulers {
+			<-running.drained
+			running.collector.Close()
 		}
 	}()
 
 	resetTimer := func(next time.Time) {
-		stopTimer(timer)
+		stopControllerTimer(timer)
 		timerAt = next
-		delay := time.Until(next)
-		if delay < 0 {
-			delay = 0
+		timer = c.options.NewTimer(next)
+		timerC = timer.C()
+	}
+	scheduleNextTimer := func() {
+		next := time.Time{}
+		if len(pending) > 0 {
+			next = pending[0].GetActivatesAt().AsTime()
 		}
-		timer = time.NewTimer(delay)
-		timerC = timer.C
+		if current != nil {
+			deadline := current.GetDeadline().AsTime()
+			if next.IsZero() || deadline.Before(next) {
+				next = deadline
+			}
+			if !metricAt.IsZero() && metricAt.Before(next) {
+				next = metricAt
+			}
+		}
+		if next.IsZero() {
+			stopControllerTimer(timer)
+			timer, timerC, timerAt = nil, nil, time.Time{}
+			return
+		}
+		resetTimer(next)
+	}
+	pumpEmissions := func() error {
+		for {
+			// Sequence snapshots by readiness, allowing a drained older revision
+			// to follow newer metrics without blocking live observability.
+			ready := -1
+			for index, emission := range emissions {
+				if emission.ready {
+					ready = index
+					break
+				}
+			}
+			if ready < 0 {
+				return nil
+			}
+			next := emissions[ready]
+			if err := c.emitSnapshot(
+				next.assignment,
+				next.snapshot,
+				&sequence,
+				next.intervalStart,
+				next.intervalEnd,
+				next.final,
+			); err != nil {
+				return err
+			}
+			emissions = append(emissions[:ready], emissions[ready+1:]...)
+		}
+	}
+	queueSnapshot := func(
+		assignment *loadtestv1.LoadAssignment,
+		snapshot metrics.Snapshot,
+		start time.Time,
+		end time.Time,
+		final bool,
+	) error {
+		emissions = append(emissions, &metricEmission{
+			assignment:    assignment,
+			intervalStart: start,
+			intervalEnd:   end,
+			snapshot:      snapshot,
+			final:         final,
+			ready:         true,
+		})
+		return pumpEmissions()
+	}
+	startScheduler := func(assignment *loadtestv1.LoadAssignment) (*revisionScheduler, error) {
+		collector, err := metrics.NewCollector(c.options.MetricsBufferSize)
+		if err != nil {
+			return nil, err
+		}
+		cancel, done, err := c.startAssignmentScheduler(assignment, collector)
+		if err != nil {
+			collector.Close()
+			return nil, err
+		}
+		if cancel == nil || done == nil {
+			if cancel != nil {
+				cancel()
+			}
+			collector.Close()
+			return nil, errors.New("scheduler must return cancellation and completion signals")
+		}
+		running := &revisionScheduler{
+			cancel:    cancel,
+			done:      done,
+			collector: collector,
+			drained:   make(chan struct{}),
+		}
+		schedulers = append(schedulers, running)
+		go c.awaitRevisionDrain(running, drains)
+		return running, nil
+	}
+	beginDrain := func(assignment *loadtestv1.LoadAssignment, running *revisionScheduler, start, end time.Time) {
+		if running == nil {
+			return
+		}
+		running.cancel()
+		emission := &metricEmission{
+			assignment:    assignment,
+			intervalStart: start,
+			intervalEnd:   end,
+			final:         true,
+		}
+		if running.completed {
+			emission.snapshot = running.snapshot
+			emission.ready = true
+		}
+		running.emission = emission
+		emissions = append(emissions, emission)
+	}
+	activatePending := func() error {
+		next := pending[0]
+		activation := next.GetActivatesAt().AsTime()
+		if current != nil {
+			if isActiveLoad(current.GetLoad()) && activation.After(intervalStart) {
+				beginDrain(current, scheduler, intervalStart, activation)
+			}
+		}
+
+		active := isActiveLoad(next.GetLoad()) && activation.Before(next.GetDeadline().AsTime())
+		if active {
+			var err error
+			scheduler, err = startScheduler(next)
+			if err != nil {
+				return err
+			}
+			metricAt = nextMetricBoundary(next.GetStartsAt().AsTime(), activation, next.GetDeadline().AsTime(), c.options.ReportingInterval)
+		} else {
+			scheduler = nil
+			metricAt = time.Time{}
+		}
+		intervalStart = activation
+		current, pending = next, pending[1:]
+		c.setStatus(next, active)
+		return pumpEmissions()
 	}
 
 	for {
@@ -195,94 +379,105 @@ func (c *runController) run() {
 		case <-c.ctx.Done():
 			return
 		case command := <-c.commands:
-			duplicate, err := validateRunTransition(current, command.assignment)
+			latest := current
+			if len(pending) > 0 {
+				latest = pending[len(pending)-1]
+			}
+			duplicate, err := validateRunTransition(latest, command.assignment)
 			if err != nil || duplicate {
 				command.reply <- err
 				continue
 			}
-
 			now := c.options.Now()
-			if current != nil {
-				c.options.StopScheduler(schedulerCancel, schedulerDone)
-				schedulerCancel, schedulerDone = nil, nil
-				now = c.options.Now()
-				transitionEnd := minTime(now, current.GetDeadline().AsTime())
-				if isActiveLoad(current.GetLoad()) && collector != nil {
-					if transitionEnd.Sub(intervalStart) > c.options.ReportingInterval {
-						err := errors.New("revision flush exceeded the reporting interval")
-						command.reply <- err
-						c.reportError(err)
-						return
-					}
-					if transitionEnd.After(intervalStart) {
-						if err := c.flush(current, collector, &sequence, intervalStart, transitionEnd, true); err != nil {
-							command.reply <- err
-							c.reportError(err)
-							return
-						}
-					}
-				}
+			if latest != nil && !command.assignment.GetActivatesAt().AsTime().After(now) {
+				command.reply <- errors.New("replacement activation time must be in the future")
+				continue
 			}
-
-			next := command.assignment
-			active := isActiveLoad(next.GetLoad()) && now.Before(next.GetDeadline().AsTime())
-			if active && collector == nil {
-				collector, err = metrics.NewCollector(c.options.MetricsBufferSize)
-				if err != nil {
-					command.reply <- err
-					continue
-				}
-			}
-			if active {
-				schedulerCancel, schedulerDone, err = c.startScheduler(next, collector)
-				if err != nil {
-					command.reply <- err
-					continue
-				}
-				intervalStart = maxTime(now, next.GetStartsAt().AsTime())
-				resetTimer(nextMetricBoundary(next.GetStartsAt().AsTime(), now, next.GetDeadline().AsTime(), c.options.ReportingInterval))
-			} else {
-				intervalStart = next.GetStartsAt().AsTime()
-				resetTimer(next.GetDeadline().AsTime())
-			}
-			current = next
-			c.setStatus(next, active)
+			pending = append(pending, command.assignment)
+			scheduleNextTimer()
 			command.reply <- nil
 
 		case <-timerC:
+			if len(pending) > 0 && timerAt.Equal(pending[0].GetActivatesAt().AsTime()) {
+				if err := activatePending(); err != nil {
+					c.reportError(err)
+					return
+				}
+				scheduleNextTimer()
+				continue
+			}
 			if current == nil {
+				timerC = nil
 				continue
 			}
 			deadline := current.GetDeadline().AsTime()
 			if !timerAt.Before(deadline) {
-				c.options.StopScheduler(schedulerCancel, schedulerDone)
-				schedulerCancel, schedulerDone = nil, nil
-				if isActiveLoad(current.GetLoad()) && collector != nil && deadline.After(intervalStart) {
-					if err := c.flush(current, collector, &sequence, intervalStart, deadline, true); err != nil {
-						c.reportError(err)
-						return
-					}
+				if isActiveLoad(current.GetLoad()) && deadline.After(intervalStart) {
+					beginDrain(current, scheduler, intervalStart, deadline)
 				}
+				scheduler = nil
 				c.setStatus(current, false)
-				timerC = nil
+				metricAt = time.Time{}
+				stopControllerTimer(timer)
+				timer, timerC, timerAt = nil, nil, time.Time{}
+				if err := pumpEmissions(); err != nil {
+					c.reportError(err)
+					return
+				}
 				continue
 			}
-			if isActiveLoad(current.GetLoad()) && collector != nil && timerAt.After(intervalStart) {
-				if err := c.flush(current, collector, &sequence, intervalStart, timerAt, false); err != nil {
+			if isActiveLoad(current.GetLoad()) && scheduler != nil && timerAt.After(intervalStart) {
+				snapshot := scheduler.collector.SnapshotAndReset()
+				if scheduler.completed {
+					snapshot = scheduler.snapshot
+					scheduler.snapshot = metrics.Snapshot{}
+				}
+				if err := queueSnapshot(current, snapshot, intervalStart, timerAt, false); err != nil {
 					c.reportError(err)
 					return
 				}
 				intervalStart = timerAt
 			}
-			resetTimer(nextMetricBoundary(current.GetStartsAt().AsTime(), timerAt, deadline, c.options.ReportingInterval))
+			metricAt = nextMetricBoundary(current.GetStartsAt().AsTime(), timerAt, deadline, c.options.ReportingInterval)
+			scheduleNextTimer()
 
-		case err := <-schedulerDone:
-			schedulerCancel, schedulerDone = nil, nil
-			if err != nil {
-				c.reportError(fmt.Errorf("run assigned load: %w", err))
+		case drained := <-drains:
+			snapshot := drained.scheduler.collector.Close()
+			drained.scheduler.completed = true
+			drained.scheduler.snapshot = snapshot
+			if drained.scheduler.emission != nil {
+				drained.scheduler.emission.snapshot = snapshot
+				drained.scheduler.emission.ready = true
+			}
+			if drained.err != nil {
+				c.reportError(fmt.Errorf("run assigned load: %w", drained.err))
+				return
+			}
+			if err := pumpEmissions(); err != nil {
+				c.reportError(err)
 				return
 			}
 		}
+	}
+}
+
+func (c *runController) startAssignmentScheduler(
+	assignment *loadtestv1.LoadAssignment,
+	collector *metrics.Collector,
+) (context.CancelFunc, <-chan error, error) {
+	if c.options.StartScheduler != nil {
+		return c.options.StartScheduler(assignment, collector)
+	}
+	return c.startScheduler(assignment, collector)
+}
+
+func (c *runController) awaitRevisionDrain(running *revisionScheduler, drains chan<- revisionDrain) {
+	defer close(running.drained)
+	err := <-running.done
+	select {
+	case drains <- revisionDrain{scheduler: running, err: err}:
+	case <-c.ctx.Done():
+		running.collector.Close()
 	}
 }
 
@@ -302,40 +497,50 @@ func (c *runController) startScheduler(
 		return nil, nil, fmt.Errorf("configure assigned HTTP target: %w", err)
 	}
 	tracked := &inFlightProtocol{next: executor, count: &c.inFlight}
-	ctx, cancel := context.WithDeadline(c.ctx, assignment.GetDeadline().AsTime())
+	requestCtx, cancelRequests := context.WithDeadline(c.ctx, assignment.GetDeadline().AsTime())
+	scheduleCtx, stopScheduling := context.WithCancel(requestCtx)
 	done := make(chan error, 1)
 	go func() {
+		defer cancelRequests()
 		load := assignment.GetLoad()
 		switch load.GetModel() {
 		case loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_VUS:
-			done <- loadgen.RunClosed(ctx, tracked, collector, loadgen.ClosedOptions{
+			done <- loadgen.RunClosedWithRequestContext(scheduleCtx, requestCtx, tracked, collector, loadgen.ClosedOptions{
 				VirtualUsers: int(load.GetVirtualUsers()),
 				RampUp:       load.GetRampUp().AsDuration(),
 				StartAt:      assignment.GetStartsAt().AsTime(),
 			})
 		case loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE:
-			done <- loadgen.RunOpen(ctx, tracked, collector, loadgen.OpenOptions{
-				Rate:        int(load.GetRate()),
-				MaxInFlight: int(load.GetMaxInFlight()),
-				RampUp:      load.GetRampUp().AsDuration(),
-				StartAt:     assignment.GetStartsAt().AsTime(),
-			})
+			done <- loadgen.RunOpenWithRequestContext(scheduleCtx, requestCtx, tracked, collector, openOptionsForLoad(load, assignment.GetStartsAt().AsTime()))
 		default:
 			done <- fmt.Errorf("unsupported assigned load model %v", load.GetModel())
 		}
 	}()
-	return cancel, done, nil
+	return stopScheduling, done, nil
 }
 
-func (c *runController) flush(
+// openOptionsForLoad preserves the local capacity allocation while forwarding
+// the global sequence metadata that makes constant-rate workers disjoint.
+func openOptionsForLoad(load *loadtestv1.LoadSlice, startsAt time.Time) loadgen.OpenOptions {
+	return loadgen.OpenOptions{
+		Rate:               int(load.GetRate()),
+		GlobalRate:         int(load.GetGlobalRate()),
+		ScheduleShardIndex: int(load.GetScheduleShardIndex()),
+		ScheduleShardCount: int(load.GetScheduleShardCount()),
+		MaxInFlight:        int(load.GetMaxInFlight()),
+		RampUp:             load.GetRampUp().AsDuration(),
+		StartAt:            startsAt,
+	}
+}
+
+func (c *runController) emitSnapshot(
 	assignment *loadtestv1.LoadAssignment,
-	collector *metrics.Collector,
+	snapshot metrics.Snapshot,
 	sequence *uint64,
 	intervalStart time.Time,
 	intervalEnd time.Time,
 	finalForRevision bool,
 ) error {
-	snapshot := collector.SnapshotAndReset()
 	delta, err := newMetricsDelta(
 		c.workerID,
 		assignment.GetRunId(),
@@ -383,6 +588,22 @@ func validateRunTransition(current, next *loadtestv1.LoadAssignment) (bool, erro
 	if err := validateAssignment(next); err != nil {
 		return false, err
 	}
+	if next.GetActivatesAt() == nil {
+		return false, errors.New("activation time is required")
+	}
+	if err := next.GetActivatesAt().CheckValid(); err != nil {
+		return false, fmt.Errorf("invalid activation time: %w", err)
+	}
+	activation := next.GetActivatesAt().AsTime()
+	if activation.Before(next.GetStartsAt().AsTime()) {
+		return false, errors.New("activation time must not be before the run start")
+	}
+	if next.GetRevision() == 1 && !activation.Equal(next.GetStartsAt().AsTime()) {
+		return false, errors.New("initial activation time must equal the run start")
+	}
+	if !activation.Before(next.GetDeadline().AsTime()) {
+		return false, errors.New("activation time must be before the deadline")
+	}
 	if current == nil {
 		return false, nil
 	}
@@ -404,6 +625,9 @@ func validateRunTransition(current, next *loadtestv1.LoadAssignment) (bool, erro
 	}
 	if !proto.Equal(next.GetTarget(), current.GetTarget()) {
 		return false, errors.New("replacement assignment must preserve the target")
+	}
+	if !activation.After(current.GetActivatesAt().AsTime()) {
+		return false, errors.New("replacement activation time must increase")
 	}
 	return false, nil
 }
@@ -431,37 +655,15 @@ func nextMetricBoundary(started, now, deadline time.Time, interval time.Duration
 	return minTime(next, deadline)
 }
 
-func stopScheduler(cancel context.CancelFunc, done <-chan error) {
-	if cancel == nil {
-		return
-	}
-	cancel()
-	if done != nil {
-		<-done
-	}
-}
-
-func stopTimer(timer *time.Timer) {
+func stopControllerTimer(timer controllerTimer) {
 	if timer == nil {
 		return
 	}
-	if !timer.Stop() {
-		select {
-		case <-timer.C:
-		default:
-		}
-	}
+	timer.Stop()
 }
 
 func minTime(left, right time.Time) time.Time {
 	if left.Before(right) {
-		return left
-	}
-	return right
-}
-
-func maxTime(left, right time.Time) time.Time {
-	if left.After(right) {
 		return left
 	}
 	return right

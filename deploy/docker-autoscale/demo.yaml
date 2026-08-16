@@ -1,0 +1,22 @@
+name: docker-autoscale-demo
+
+target:
+  protocol: http
+  method: GET
+  url: http://autoscale-target:8080/echo
+
+load:
+  model: constant-rate
+  rate: 1200
+  max_in_flight: 12000
+  duration: 45s
+  ramp_up: 10s
+
+fleet:
+  min_workers: 1
+  max_workers: 4
+  autoscale: true
+
+thresholds:
+  p99_latency: 0
+  error_rate: 1

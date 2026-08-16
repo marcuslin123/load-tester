@@ -225,6 +225,9 @@ func validate(cfg Config) error {
 	if cfg.Fleet.MaxWorkers < cfg.Fleet.MinWorkers {
 		return fieldError("fleet.max_workers", "must be greater than or equal to fleet.min_workers")
 	}
+	if cfg.Fleet.Autoscale && cfg.Load.Model != LoadConstantRate {
+		return fieldError("fleet.autoscale", "is only valid for constant-rate")
+	}
 	if cfg.Thresholds.P99Latency < 0 {
 		return fieldError("thresholds.p99_latency", "must be greater than or equal to 0")
 	}

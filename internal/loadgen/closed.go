@@ -25,6 +25,28 @@ type ClosedOptions struct {
 // RunClosed keeps one sequential request loop active per virtual user until the
 // caller cancels ctx.
 func RunClosed(ctx context.Context, executor protocol.Protocol, sink ResultSink, options ClosedOptions) error {
+	return runClosed(ctx, ctx, executor, sink, options)
+}
+
+// RunClosedWithRequestContext stops virtual-user loops when scheduleCtx ends
+// while allowing their current requests to finish under requestCtx.
+func RunClosedWithRequestContext(
+	scheduleCtx context.Context,
+	requestCtx context.Context,
+	executor protocol.Protocol,
+	sink ResultSink,
+	options ClosedOptions,
+) error {
+	return runClosed(scheduleCtx, requestCtx, executor, sink, options)
+}
+
+func runClosed(
+	scheduleCtx context.Context,
+	requestCtx context.Context,
+	executor protocol.Protocol,
+	sink ResultSink,
+	options ClosedOptions,
+) error {
 	if options.VirtualUsers <= 0 {
 		return errors.New("virtual users must be greater than zero")
 	}
@@ -37,6 +59,12 @@ func RunClosed(ctx context.Context, executor protocol.Protocol, sink ResultSink,
 	if sink == nil {
 		return errors.New("result sink is required")
 	}
+	if scheduleCtx == nil {
+		return errors.New("schedule context is required")
+	}
+	if requestCtx == nil {
+		return errors.New("request context is required")
+	}
 
 	var users sync.WaitGroup
 	rampStarted := options.StartAt
@@ -45,21 +73,21 @@ func RunClosed(ctx context.Context, executor protocol.Protocol, sink ResultSink,
 	}
 	for user := range options.VirtualUsers {
 		delay := rampDelay(user, options.VirtualUsers, options.RampUp)
-		if !waitForRamp(ctx, time.Until(rampStarted.Add(delay))) {
+		if !waitForRamp(scheduleCtx, time.Until(rampStarted.Add(delay))) {
 			break
 		}
 		users.Add(1)
-		go runVirtualUser(ctx, executor, sink, &users)
+		go runVirtualUser(scheduleCtx, requestCtx, executor, sink, &users)
 	}
 	users.Wait()
 	return nil
 }
 
-func runVirtualUser(ctx context.Context, executor protocol.Protocol, sink ResultSink, users *sync.WaitGroup) {
+func runVirtualUser(scheduleCtx context.Context, requestCtx context.Context, executor protocol.Protocol, sink ResultSink, users *sync.WaitGroup) {
 	defer users.Done()
-	for ctx.Err() == nil {
-		result := executor.Execute(ctx)
-		if interruptedByRun(ctx, result) {
+	for scheduleCtx.Err() == nil {
+		result := executor.Execute(requestCtx)
+		if interruptedByRun(requestCtx, result) {
 			return
 		}
 		// A full metrics sink may drop this sample, but it must not slow the user.

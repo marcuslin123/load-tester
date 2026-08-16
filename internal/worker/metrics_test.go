@@ -18,6 +18,9 @@ func TestNewMetricsDeltaPreservesSnapshotAndInterval(t *testing.T) {
 	collector.Offer(protocol.Result{Latency: 20 * time.Millisecond, StatusCode: 200, BytesRead: 10})
 	collector.Offer(protocol.Result{Latency: 40 * time.Millisecond, StatusCode: 503, BytesRead: 20})
 	collector.Offer(protocol.Result{Latency: 60 * time.Millisecond, Err: errors.New("connection reset")})
+	collector.OfferAdmittedArrival()
+	collector.OfferAdmittedArrival()
+	collector.OfferAdmittedArrival()
 	collector.OfferUnmetDemand()
 	snapshot := collector.Close()
 	intervalStart := time.Date(2026, time.August, 4, 12, 0, 1, 0, time.UTC)
@@ -45,6 +48,9 @@ func TestNewMetricsDeltaPreservesSnapshotAndInterval(t *testing.T) {
 	}
 	if counters.GetTransportErrors() != 1 || counters.GetServerErrors() != 1 || counters.GetUnmetDemand() != 1 {
 		t.Errorf("failure counters = %+v, want transport=1 server=1 unmet=1", counters)
+	}
+	if counters.GetAdmittedArrivals() != 3 {
+		t.Errorf("admitted arrivals = %d, want 3", counters.GetAdmittedArrivals())
 	}
 	if counters.GetBytesRead() != 30 || counters.GetStatusCodes()[200] != 1 || counters.GetStatusCodes()[503] != 1 {
 		t.Errorf("response counters = %+v, want bytes=30 and statuses 200/503", counters)

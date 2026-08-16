@@ -3,6 +3,7 @@ package docker
 import (
 	"context"
 	"fmt"
+	"math"
 
 	"github.com/containerd/errdefs"
 	containertypes "github.com/moby/moby/api/types/container"
@@ -76,6 +77,7 @@ func toMobyCreateOptions(spec containerSpec) client.ContainerCreateOptions {
 			NetworkMode:   containertypes.NetworkMode(spec.Network),
 			ExtraHosts:    spec.ExtraHosts,
 			RestartPolicy: containertypes.RestartPolicy{Name: containertypes.RestartPolicyMode(spec.RestartPolicy)},
+			Resources:     containertypes.Resources{NanoCPUs: int64(math.Round(spec.WorkerCPUs * 1_000_000_000))},
 		},
 	}
 }

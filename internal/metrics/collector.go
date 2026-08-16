@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"errors"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -13,15 +14,24 @@ type eventKind uint8
 
 const (
 	resultEvent eventKind = iota
-	unmetDemandEvent
 	snapshotEvent
 	closeEvent
 )
 
 type event struct {
-	kind   eventKind
-	result protocol.Result
-	reply  chan Snapshot
+	kind     eventKind
+	result   protocol.Result
+	reply    chan Snapshot
+	dropped  uint64
+	admitted uint64
+	unmet    uint64
+}
+
+type arrivalCounters struct {
+	writers  atomic.Uint64
+	sealed   atomic.Bool
+	admitted atomic.Uint64
+	unmet    atomic.Uint64
 }
 
 // Collector aggregates request results on one goroutine so request goroutines
@@ -29,6 +39,7 @@ type event struct {
 type Collector struct {
 	events    chan event
 	dropped   atomic.Uint64
+	arrivals  atomic.Pointer[arrivalCounters]
 	closed    atomic.Bool
 	controlMu sync.Mutex
 	closeOnce sync.Once
@@ -42,6 +53,7 @@ func NewCollector(bufferSize int) (*Collector, error) {
 	}
 
 	collector := &Collector{events: make(chan event, bufferSize)}
+	collector.arrivals.Store(&arrivalCounters{})
 	go collector.run()
 	return collector, nil
 }
@@ -55,12 +67,19 @@ func (c *Collector) Offer(result protocol.Result) bool {
 	return offerResult(c.events, &c.dropped, result)
 }
 
+// OfferAdmittedArrival records a scheduled arrival after it acquires an
+// in-flight slot, independently of request completion reporting.
+func (c *Collector) OfferAdmittedArrival() bool {
+	return c.recordArrival(func(counters *arrivalCounters) {
+		counters.admitted.Add(1)
+	})
+}
+
 // OfferUnmetDemand records a scheduled arrival that could not become a request.
 func (c *Collector) OfferUnmetDemand() bool {
-	if c.closed.Load() {
-		return false
-	}
-	return offerEvent(c.events, &c.dropped, event{kind: unmetDemandEvent})
+	return c.recordArrival(func(counters *arrivalCounters) {
+		counters.unmet.Add(1)
+	})
 }
 
 // SnapshotAndReset returns the completed interval after all results queued
@@ -73,8 +92,16 @@ func (c *Collector) SnapshotAndReset() Snapshot {
 		return newSnapshot()
 	}
 
+	dropped := c.dropped.Swap(0)
+	arrivals := c.rotateArrivalCounters()
 	reply := make(chan Snapshot, 1)
-	c.events <- event{kind: snapshotEvent, reply: reply}
+	c.events <- event{
+		kind:     snapshotEvent,
+		reply:    reply,
+		dropped:  dropped,
+		admitted: arrivals.admitted.Load(),
+		unmet:    arrivals.unmet.Load(),
+	}
 	return <-reply
 }
 
@@ -86,8 +113,16 @@ func (c *Collector) Close() Snapshot {
 		defer c.controlMu.Unlock()
 
 		c.closed.Store(true)
+		dropped := c.dropped.Swap(0)
+		arrivals := c.rotateArrivalCounters()
 		reply := make(chan Snapshot, 1)
-		c.events <- event{kind: closeEvent, reply: reply}
+		c.events <- event{
+			kind:     closeEvent,
+			reply:    reply,
+			dropped:  dropped,
+			admitted: arrivals.admitted.Load(),
+			unmet:    arrivals.unmet.Load(),
+		}
 		c.final = <-reply
 	})
 
@@ -102,14 +137,12 @@ func (c *Collector) run() {
 		switch next.kind {
 		case resultEvent:
 			recordResult(&snapshot, next.result)
-		case unmetDemandEvent:
-			snapshot.UnmetDemand++
 		case snapshotEvent:
-			snapshot.DroppedSamples = c.dropped.Swap(0)
+			c.snapshotCounters(&snapshot, next)
 			next.reply <- snapshot
 			snapshot = newSnapshot()
 		case closeEvent:
-			snapshot.DroppedSamples = c.dropped.Swap(0)
+			c.snapshotCounters(&snapshot, next)
 			next.reply <- snapshot
 			return
 		}
@@ -117,17 +150,62 @@ func (c *Collector) run() {
 }
 
 func offerResult(events chan<- event, dropped *atomic.Uint64, result protocol.Result) bool {
-	return offerEvent(events, dropped, event{kind: resultEvent, result: result})
-}
-
-func offerEvent(events chan<- event, dropped *atomic.Uint64, next event) bool {
 	select {
-	case events <- next:
+	case events <- event{kind: resultEvent, result: result}:
 		return true
 	default:
 		dropped.Add(1)
 		return false
 	}
+}
+
+func (c *Collector) snapshotCounters(snapshot *Snapshot, boundary event) {
+	snapshot.DroppedSamples = boundary.dropped
+	snapshot.AdmittedArrivals = boundary.admitted
+	snapshot.UnmetDemand = boundary.unmet
+}
+
+// recordArrival uses a lock-free generation handoff so request goroutines never
+// wait for the result queue or the snapshot consumer.
+func (c *Collector) recordArrival(record func(*arrivalCounters)) bool {
+	for {
+		if c.closed.Load() {
+			return false
+		}
+		counters := c.currentArrivalCounters()
+		counters.writers.Add(1)
+		if counters.sealed.Load() || c.closed.Load() {
+			counters.writers.Add(^uint64(0))
+			continue
+		}
+		record(counters)
+		counters.writers.Add(^uint64(0))
+		return true
+	}
+}
+
+func (c *Collector) currentArrivalCounters() *arrivalCounters {
+	if counters := c.arrivals.Load(); counters != nil {
+		return counters
+	}
+	fresh := &arrivalCounters{}
+	if c.arrivals.CompareAndSwap(nil, fresh) {
+		return fresh
+	}
+	return c.arrivals.Load()
+}
+
+// rotateArrivalCounters is the linearization point for admitted and unmet
+// arrivals. Existing writers finish in the sealed generation; later writers
+// retry against the new generation without taking a lock.
+func (c *Collector) rotateArrivalCounters() *arrivalCounters {
+	current := c.currentArrivalCounters()
+	current.sealed.Store(true)
+	c.arrivals.Store(&arrivalCounters{})
+	for current.writers.Load() != 0 {
+		runtime.Gosched()
+	}
+	return current
 }
 
 func newSnapshot() Snapshot {

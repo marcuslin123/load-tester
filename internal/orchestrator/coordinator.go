@@ -31,16 +31,19 @@ type assignmentCoordinator struct {
 	leadTime time.Duration
 	now      func() time.Time
 	changed  chan struct{}
-	started  chan runWindow
+	started  chan struct{}
+	window   RunWindow
 
-	revision uint64
-	startsAt time.Time
-	deadline time.Time
+	revision    uint64
+	startsAt    time.Time
+	deadline    time.Time
+	activatesAt time.Time
 
 	failureMu       sync.Mutex
 	pendingFailures map[string]workerFailure
-	delivered       map[string]*loadtestv1.LoadAssignment
+	delivered       map[string][]*loadtestv1.LoadAssignment
 	recovery        map[string]workerRecovery
+	restorations    []capacityRestoration
 }
 
 type workerFailure struct {
@@ -54,9 +57,11 @@ type workerRecovery struct {
 	load     *loadtestv1.LoadSlice
 }
 
-type runWindow struct {
-	startsAt time.Time
-	deadline time.Time
+type capacityRestoration struct {
+	activatesAt time.Time
+	providers   map[string]struct{}
+	recovered   map[string]*loadtestv1.LoadSlice
+	invalidated bool
 }
 
 func newAssignmentCoordinator(
@@ -87,9 +92,9 @@ func newAssignmentCoordinator(
 		leadTime:        options.LeadTime,
 		now:             now,
 		changed:         make(chan struct{}, 1),
-		started:         make(chan runWindow, 1),
+		started:         make(chan struct{}),
 		pendingFailures: make(map[string]workerFailure),
-		delivered:       make(map[string]*loadtestv1.LoadAssignment),
+		delivered:       make(map[string][]*loadtestv1.LoadAssignment),
 		recovery:        make(map[string]workerRecovery),
 	}, nil
 }
@@ -141,9 +146,21 @@ func (c *assignmentCoordinator) reconcile() {
 	if c.revision == 0 {
 		c.startsAt = now.Add(c.leadTime)
 		c.deadline = c.startsAt.Add(c.config.Load.Duration)
-		c.started <- runWindow{startsAt: c.startsAt, deadline: c.deadline}
+		c.activatesAt = c.startsAt
+		c.window = RunWindow{StartsAt: c.startsAt, Deadline: c.deadline}
+		close(c.started)
 	} else if !now.Before(c.deadline) {
 		return
+	} else {
+		activationBase := now
+		if c.activatesAt.After(activationBase) {
+			activationBase = c.activatesAt
+		}
+		activatesAt := activationBase.Add(c.leadTime)
+		if !activatesAt.Before(c.deadline) {
+			return
+		}
+		c.activatesAt = activatesAt
 	}
 
 	workerIDs := make([]string, len(workers))
@@ -169,6 +186,7 @@ func (c *assignmentCoordinator) reconcile() {
 		c.server.metrics.RecordAssignments(c.revision, assignments)
 	}
 	deliveredLoads := make([]*loadtestv1.LoadSlice, 0, len(workers))
+	deliveredWorkers := make([]string, 0, len(workers))
 	for _, worker := range workers {
 		assignment := assignments[worker.state.ID]
 		if err := worker.send(&loadtestv1.OrchestratorMessage{Payload: &loadtestv1.OrchestratorMessage_Assignment{
@@ -184,11 +202,14 @@ func (c *assignmentCoordinator) reconcile() {
 			c.server.removeSessionWithReason(worker.state.ID, worker, "assignment delivery failed")
 			continue
 		}
-		c.delivered[worker.state.ID] = proto.Clone(assignment).(*loadtestv1.LoadAssignment)
+		c.recordDelivered(worker.state.ID, assignment)
 		deliveredLoads = append(deliveredLoads, assignment.GetLoad())
+		if isActiveSlice(assignment.GetLoad()) {
+			deliveredWorkers = append(deliveredWorkers, worker.state.ID)
+		}
 	}
 	if c.restoresConfiguredCapacity(deliveredLoads) {
-		c.recordRecoveredDemand(c.now())
+		c.recordRecoveredDemand(c.activatesAt, deliveredWorkers)
 	}
 }
 
@@ -221,7 +242,8 @@ func (c *assignmentCoordinator) processFailures() {
 	c.failureMu.Unlock()
 
 	for workerID, failure := range failures {
-		assignment := c.delivered[workerID]
+		c.invalidateRestorations(workerID, failure.detected)
+		assignment := c.activeDeliveryAt(workerID, failure.detected)
 		delete(c.delivered, workerID)
 		if assignment == nil || c.revision == 0 || c.ctx.Err() != nil ||
 			!failure.detected.Before(c.deadline) || !isActiveSlice(assignment.GetLoad()) {
@@ -229,10 +251,10 @@ func (c *assignmentCoordinator) processFailures() {
 		}
 		if c.server.metrics.RecordWorkerFailure(workerID, failure.reason) &&
 			assignment.GetLoad().GetModel() == loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE {
-			c.recovery[workerID] = workerRecovery{
+			c.addRecovery(workerID, workerRecovery{
 				detected: failure.detected,
 				load:     proto.Clone(assignment.GetLoad()).(*loadtestv1.LoadSlice),
-			}
+			})
 			c.server.logger.Printf(
 				"worker recovery pending: worker_id=%s run_id=%s rate=%d detected_at=%s",
 				workerID,
@@ -244,21 +266,77 @@ func (c *assignmentCoordinator) processFailures() {
 	}
 }
 
+func (c *assignmentCoordinator) addRecovery(workerID string, recovery workerRecovery) {
+	current, exists := c.recovery[workerID]
+	if exists && !recovery.detected.Before(current.detected) {
+		return
+	}
+	c.recovery[workerID] = recovery
+}
+
+// invalidateRestorations extends an optimistically credited recovery when one
+// of its providers dies before the shared assignment activation.
+func (c *assignmentCoordinator) invalidateRestorations(workerID string, detected time.Time) {
+	for index := range c.restorations {
+		restoration := &c.restorations[index]
+		if restoration.invalidated || !detected.Before(restoration.activatesAt) {
+			continue
+		}
+		if _, provides := restoration.providers[workerID]; !provides {
+			continue
+		}
+		restoration.invalidated = true
+		for recoveredID, load := range restoration.recovered {
+			c.addRecovery(recoveredID, workerRecovery{
+				detected: restoration.activatesAt,
+				load:     proto.Clone(load).(*loadtestv1.LoadSlice),
+			})
+		}
+	}
+}
+
+// recordDelivered retains pending revisions so a pre-activation failure can
+// still be attributed to the assignment that was active at detection time.
+func (c *assignmentCoordinator) recordDelivered(workerID string, assignment *loadtestv1.LoadAssignment) {
+	if c.delivered == nil {
+		c.delivered = make(map[string][]*loadtestv1.LoadAssignment)
+	}
+	c.delivered[workerID] = append(
+		c.delivered[workerID],
+		proto.Clone(assignment).(*loadtestv1.LoadAssignment),
+	)
+}
+
+func (c *assignmentCoordinator) activeDeliveryAt(workerID string, at time.Time) *loadtestv1.LoadAssignment {
+	history := c.delivered[workerID]
+	for index := len(history) - 1; index >= 0; index-- {
+		assignment := history[index]
+		if !assignment.GetActivatesAt().AsTime().After(at) {
+			return assignment
+		}
+	}
+	return nil
+}
+
 // recordRecoveredDemand adds only arrivals whose absolute deadlines passed
 // before a successful replacement assignment restored open-model capacity.
-func (c *assignmentCoordinator) recordRecoveredDemand(restored time.Time) {
+func (c *assignmentCoordinator) recordRecoveredDemand(restored time.Time, providerIDs []string) {
+	providers := make(map[string]struct{}, len(providerIDs))
+	for _, workerID := range providerIDs {
+		providers[workerID] = struct{}{}
+	}
+	recovered := make(map[string]*loadtestv1.LoadSlice, len(c.recovery))
 	for workerID, recovery := range c.recovery {
-		count := loadgen.ScheduledArrivalsBetween(
-			c.startsAt,
-			recovery.detected,
-			restored,
-			int(recovery.load.GetRate()),
-			recovery.load.GetRampUp().AsDuration(),
-		)
-		if err := c.server.metrics.AddRecoveryUnmetDemand(workerID, count); err != nil {
+		records := c.recoveryArrivalRecords(recovery, restored)
+		if err := c.server.metrics.addRecoveryUnmetDemandRecords(workerID, records); err != nil {
 			c.server.logger.Printf("record recovery demand: worker_id=%s run_id=%s error=%v", workerID, c.runID, err)
 			continue
 		}
+		var count uint64
+		for _, record := range records {
+			count += record.unmet
+		}
+		recovered[workerID] = proto.Clone(recovery.load).(*loadtestv1.LoadSlice)
 		c.server.logger.Printf(
 			"worker recovery accounted: worker_id=%s run_id=%s unmet_demand=%d restored_at=%s",
 			workerID,
@@ -268,6 +346,48 @@ func (c *assignmentCoordinator) recordRecoveredDemand(restored time.Time) {
 		)
 		delete(c.recovery, workerID)
 	}
+	if len(recovered) > 0 {
+		c.restorations = append(c.restorations, capacityRestoration{
+			activatesAt: restored,
+			providers:   providers,
+			recovered:   recovered,
+		})
+	}
+}
+
+func (c *assignmentCoordinator) recoveryArrivalRecords(recovery workerRecovery, restored time.Time) []arrivalRecord {
+	globalRate := int(recovery.load.GetGlobalRate())
+	shardIndex := int(recovery.load.GetScheduleShardIndex())
+	shardCount := int(recovery.load.GetScheduleShardCount())
+	if globalRate == 0 && shardIndex == 0 && shardCount == 0 {
+		globalRate = int(recovery.load.GetRate())
+		shardCount = 1
+	}
+	start := recovery.detected
+	if start.Before(c.startsAt) {
+		start = c.startsAt
+	}
+	records := make([]arrivalRecord, 0)
+	for start.Before(restored) {
+		elapsed := start.Sub(c.startsAt)
+		next := c.startsAt.Add((elapsed/time.Second + 1) * time.Second)
+		end := next
+		if restored.Before(end) {
+			end = restored
+		}
+		count := loadgen.ScheduledShardArrivalsBetween(
+			c.startsAt,
+			start,
+			end,
+			globalRate,
+			recovery.load.GetRampUp().AsDuration(),
+			shardIndex,
+			shardCount,
+		)
+		records = append(records, arrivalRecord{start: start, end: end, unmet: count})
+		start = end
+	}
+	return records
 }
 
 // assignmentFor combines one worker's slice with the run-wide target and time window.
@@ -287,9 +407,10 @@ func (c *assignmentCoordinator) assignmentFor(load *loadtestv1.LoadSlice) *loadt
 				Body:    []byte(c.config.Target.Body),
 			},
 		}},
-		Load:     load,
-		StartsAt: timestamppb.New(c.startsAt),
-		Deadline: timestamppb.New(c.deadline),
+		Load:        load,
+		StartsAt:    timestamppb.New(c.startsAt),
+		Deadline:    timestamppb.New(c.deadline),
+		ActivatesAt: timestamppb.New(c.activatesAt),
 	}
 }
 

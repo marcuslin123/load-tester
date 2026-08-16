@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -57,6 +58,30 @@ func TestMetricsAggregatorMergesWorkerCountersAndHistograms(t *testing.T) {
 	}
 	if !aggregator.Complete() || len(aggregator.MissingFinal()) != 0 {
 		t.Fatalf("completion = %v missing=%v, want complete", aggregator.Complete(), aggregator.MissingFinal())
+	}
+}
+
+func TestMetricsAggregatorMergesAdmittedArrivals(t *testing.T) {
+	started := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	deadline := started.Add(time.Second)
+	aggregator := newMetricsAggregator("run-admitted")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-admitted", 1, 1, started, deadline),
+	})
+	delta := metricsDeltaForTest(t, "worker-a", 1, 1, started, deadline, []protocol.Result{
+		{Latency: time.Millisecond, StatusCode: 200},
+	}, true)
+	delta.RunId = "run-admitted"
+	delta.Counters.AdmittedArrivals = 4
+
+	if err := aggregator.Accept("worker-a", delta); err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if got := aggregator.Snapshot().AdmittedArrivals; got != 4 {
+		t.Fatalf("fleet admitted arrivals = %d, want 4", got)
+	}
+	if got := aggregator.WorkerSnapshots()["worker-a"].AdmittedArrivals; got != 4 {
+		t.Fatalf("worker admitted arrivals = %d, want 4", got)
 	}
 }
 
@@ -143,6 +168,324 @@ func TestMetricsAggregatorIgnoresExactDuplicate(t *testing.T) {
 	}
 }
 
+func TestMetricsAggregatorArrivalWindowReturnsExactCompleteCounters(t *testing.T) {
+	started := time.Now()
+	boundary := started.Add(time.Second)
+	deadline := started.Add(2 * time.Second)
+	aggregator := newMetricsAggregator("run-13")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-13", 1, 1, started, deadline),
+		"worker-b": metricsAssignment("run-13", 1, 1, started, deadline),
+	})
+	workerA := metricsDeltaForTest(t, "worker-a", 1, 1, started, boundary, nil)
+	workerA.Counters.AdmittedArrivals = 40
+	workerA.Counters.UnmetDemand = 3
+	workerB := metricsDeltaForTest(t, "worker-b", 1, 1, started, boundary, nil)
+	workerB.Counters.AdmittedArrivals = 60
+	workerB.Counters.UnmetDemand = 2
+	if err := aggregator.Accept("worker-a", workerA); err != nil {
+		t.Fatalf("Accept(worker-a) error = %v", err)
+	}
+	if err := aggregator.Accept("worker-b", workerB); err != nil {
+		t.Fatalf("Accept(worker-b) error = %v", err)
+	}
+
+	got := aggregator.ArrivalWindow(started, boundary)
+	if got.Admitted != 100 || got.Unmet != 5 || !got.Complete {
+		t.Fatalf("ArrivalWindow() = %+v, want admitted=100 unmet=5 complete=true", got)
+	}
+}
+
+func TestMetricsAggregatorArrivalWindowDoesNotShiftLatePriorDelta(t *testing.T) {
+	started := time.Now()
+	firstBoundary := started.Add(time.Second)
+	secondBoundary := started.Add(2 * time.Second)
+	deadline := started.Add(3 * time.Second)
+	aggregator := newMetricsAggregator("run-13")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-13", 1, 1, started, deadline),
+	})
+
+	if got := aggregator.ArrivalWindow(started, firstBoundary); got.Complete {
+		t.Fatalf("first ArrivalWindow() = %+v, want incomplete before worker delta", got)
+	}
+	late := metricsDeltaForTest(t, "worker-a", 1, 1, started, firstBoundary, nil)
+	late.Counters.AdmittedArrivals = 40
+	current := metricsDeltaForTest(t, "worker-a", 1, 2, firstBoundary, secondBoundary, nil)
+	current.Counters.AdmittedArrivals = 60
+	if err := aggregator.Accept("worker-a", late); err != nil {
+		t.Fatalf("Accept(late) error = %v", err)
+	}
+	if err := aggregator.Accept("worker-a", current); err != nil {
+		t.Fatalf("Accept(current) error = %v", err)
+	}
+
+	got := aggregator.ArrivalWindow(firstBoundary, secondBoundary)
+	if got.Admitted != 60 || !got.Complete {
+		t.Fatalf("second ArrivalWindow() = %+v, want only current 60 arrivals", got)
+	}
+}
+
+func TestMetricsAggregatorAcceptsLateFinalFromOlderRevisionWithoutShiftingItsArrivals(t *testing.T) {
+	started := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	activation := started.Add(time.Second)
+	secondBoundary := started.Add(2 * time.Second)
+	deadline := started.Add(3 * time.Second)
+	aggregator := newMetricsAggregator("run-out-of-order-revisions")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-out-of-order-revisions", 1, 1, started, deadline),
+	})
+	revisionTwo := metricsAssignment("run-out-of-order-revisions", 2, 1, started, deadline)
+	revisionTwo.ActivatesAt = timestamppb.New(activation)
+	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{"worker-a": revisionTwo})
+
+	current := metricsDeltaForTest(t, "worker-a", 2, 1, activation, secondBoundary, []protocol.Result{
+		{Latency: 20 * time.Millisecond, StatusCode: 200},
+	})
+	current.RunId = "run-out-of-order-revisions"
+	current.Counters.AdmittedArrivals = 20
+	if err := aggregator.Accept("worker-a", current); err != nil {
+		t.Fatalf("Accept(revision 2 periodic) error = %v", err)
+	}
+	if got := aggregator.ArrivalWindow(started, activation); got.Complete {
+		t.Fatalf("old ArrivalWindow() = %+v, want incomplete before revision 1 final", got)
+	}
+
+	oldFinal := metricsDeltaForTest(t, "worker-a", 1, 2, started, activation, []protocol.Result{
+		{Latency: 10 * time.Millisecond, StatusCode: 200},
+	}, true)
+	oldFinal.RunId = "run-out-of-order-revisions"
+	oldFinal.Counters.AdmittedArrivals = 10
+	if err := aggregator.Accept("worker-a", oldFinal); err != nil {
+		t.Fatalf("Accept(late revision 1 final) error = %v", err)
+	}
+	if err := aggregator.Accept("worker-a", proto.Clone(oldFinal).(*loadtestv1.MetricsDelta)); err != nil {
+		t.Fatalf("Accept(exact late-final duplicate) error = %v", err)
+	}
+	conflict := proto.Clone(oldFinal).(*loadtestv1.MetricsDelta)
+	conflict.Counters.AdmittedArrivals++
+	if err := aggregator.Accept("worker-a", conflict); err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("Accept(conflicting late-final duplicate) error = %v, want sequence conflict", err)
+	}
+
+	snapshot := aggregator.Snapshot()
+	if snapshot.Requests != 2 || snapshot.Succeeded != 2 || snapshot.AdmittedArrivals != 30 {
+		t.Fatalf("cumulative snapshot = %+v, want requests=2 succeeded=2 admitted=30", snapshot)
+	}
+	window := aggregator.ArrivalWindow(activation, secondBoundary)
+	if window.Admitted != 20 || window.Unmet != 0 || !window.Complete {
+		t.Fatalf("new ArrivalWindow() = %+v, want only revision 2 admitted=20 complete=true", window)
+	}
+	if aggregator.Complete() {
+		t.Fatal("Complete() = true before latest revision final delta")
+	}
+
+	latestFinal := metricsDeltaForTest(t, "worker-a", 2, 3, secondBoundary, deadline, nil, true)
+	latestFinal.RunId = "run-out-of-order-revisions"
+	if err := aggregator.Accept("worker-a", latestFinal); err != nil {
+		t.Fatalf("Accept(revision 2 final) error = %v", err)
+	}
+	if !aggregator.Complete() || len(aggregator.MissingFinal()) != 0 {
+		t.Fatalf("completion = %v missing=%v, want latest revision complete", aggregator.Complete(), aggregator.MissingFinal())
+	}
+}
+
+func TestMetricsAggregatorArrivalWindowIsIncompleteUntilEveryActiveWorkerReportsThroughBoundary(t *testing.T) {
+	started := time.Now()
+	boundary := started.Add(time.Second)
+	deadline := started.Add(2 * time.Second)
+	aggregator := newMetricsAggregator("run-13")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a":    metricsAssignment("run-13", 1, 1, started, deadline),
+		"worker-b":    metricsAssignment("run-13", 1, 1, started, deadline),
+		"worker-idle": metricsAssignment("run-13", 1, 0, started, deadline),
+	})
+	delta := metricsDeltaForTest(t, "worker-a", 1, 1, started, boundary, nil)
+	delta.Counters.AdmittedArrivals = 10
+	if err := aggregator.Accept("worker-a", delta); err != nil {
+		t.Fatalf("Accept(worker-a) error = %v", err)
+	}
+
+	got := aggregator.ArrivalWindow(started, boundary)
+	if got.Admitted != 10 || got.Complete {
+		t.Fatalf("ArrivalWindow() = %+v, want admitted=10 complete=false", got)
+	}
+}
+
+func TestMetricsAggregatorArrivalWindowPrunesConsumedRecords(t *testing.T) {
+	started := time.Now()
+	deadline := started.Add(64 * time.Second)
+	aggregator := newMetricsAggregator("run-13")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-13", 1, 1, started, deadline),
+	})
+	for sequence := uint64(1); sequence <= 64; sequence++ {
+		intervalStart := started.Add(time.Duration(sequence-1) * time.Second)
+		intervalEnd := intervalStart.Add(time.Second)
+		delta := metricsDeltaForTest(t, "worker-a", 1, sequence, intervalStart, intervalEnd, nil, sequence == 64)
+		delta.Counters.AdmittedArrivals = 1
+		if err := aggregator.Accept("worker-a", delta); err != nil {
+			t.Fatalf("Accept(sequence=%d) error = %v", sequence, err)
+		}
+	}
+
+	got := aggregator.ArrivalWindow(started, deadline)
+	if got.Admitted != 64 || !got.Complete {
+		t.Fatalf("ArrivalWindow() = %+v, want all 64 arrivals", got)
+	}
+	if len(aggregator.arrivalRecords) != 0 {
+		t.Fatalf("arrival record count = %d, want 0 after consumed window", len(aggregator.arrivalRecords))
+	}
+}
+
+func TestMetricsAggregatorRejectsRevisionPartialThatCrossesReportingBoundary(t *testing.T) {
+	started := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	deadline := started.Add(10 * time.Second)
+	activation := started.Add(5300 * time.Millisecond)
+	aggregator := newMetricsAggregator("run-13")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-13", 1, 1, started, deadline),
+	})
+	replacement := metricsAssignment("run-13", 2, 1, started, deadline)
+	replacement.ActivatesAt = timestamppb.New(activation)
+	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{"worker-a": replacement})
+
+	delta := metricsDeltaForTest(
+		t,
+		"worker-a",
+		1,
+		1,
+		started.Add(4800*time.Millisecond),
+		activation,
+		nil,
+		true,
+	)
+	delta.Counters.AdmittedArrivals = 50
+	err := aggregator.Accept("worker-a", delta)
+	if err == nil || !strings.Contains(err.Error(), "reporting boundary") {
+		t.Fatalf("Accept(crossing partial) error = %v, want reporting-boundary error", err)
+	}
+	if got := aggregator.Snapshot().AdmittedArrivals; got != 0 {
+		t.Fatalf("admitted arrivals after rejected partial = %d, want 0", got)
+	}
+	if len(aggregator.arrivalRecords) != 0 {
+		t.Fatalf("arrival record count = %d, want no partially ingested record", len(aggregator.arrivalRecords))
+	}
+}
+
+func TestMetricsAggregatorArrivalWindowRequiresWorkerRemovedByFutureRevision(t *testing.T) {
+	started := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	firstBoundary := started.Add(time.Second)
+	deadline := started.Add(3 * time.Second)
+	aggregator := newMetricsAggregator("run-13")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-13", 1, 1, started, deadline),
+		"worker-b": metricsAssignment("run-13", 1, 1, started, deadline),
+	})
+	future := metricsAssignment("run-13", 2, 1, started, deadline)
+	future.ActivatesAt = timestamppb.New(started.Add(2 * time.Second))
+	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{"worker-a": future})
+
+	workerA := metricsDeltaForTest(t, "worker-a", 1, 1, started, firstBoundary, nil)
+	workerA.Counters.AdmittedArrivals = 10
+	if err := aggregator.Accept("worker-a", workerA); err != nil {
+		t.Fatalf("Accept(worker-a) error = %v", err)
+	}
+
+	got := aggregator.ArrivalWindow(started, firstBoundary)
+	if got.Admitted != 10 || got.Complete {
+		t.Fatalf("ArrivalWindow() = %+v, want admitted=10 complete=false while worker-b is missing", got)
+	}
+}
+
+func TestMetricsAggregatorArrivalWindowMergesAdjacentRevisionPartialsExactly(t *testing.T) {
+	started := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	boundary := started.Add(5 * time.Second)
+	deadline := started.Add(6 * time.Second)
+	activation := started.Add(4800 * time.Millisecond)
+	aggregator := newMetricsAggregator("run-13")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-13", 1, 1, started, deadline),
+	})
+	replacement := metricsAssignment("run-13", 2, 1, started, deadline)
+	replacement.ActivatesAt = timestamppb.New(activation)
+	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{"worker-a": replacement})
+
+	sequence := uint64(1)
+	for intervalStart := started; intervalStart.Before(started.Add(4 * time.Second)); intervalStart = intervalStart.Add(time.Second) {
+		delta := metricsDeltaForTest(t, "worker-a", 1, sequence, intervalStart, intervalStart.Add(time.Second), nil)
+		delta.Counters.AdmittedArrivals = 10
+		if err := aggregator.Accept("worker-a", delta); err != nil {
+			t.Fatalf("Accept(revision 1 sequence %d) error = %v", sequence, err)
+		}
+		sequence++
+	}
+	oldPartial := metricsDeltaForTest(t, "worker-a", 1, sequence, started.Add(4*time.Second), activation, nil, true)
+	oldPartial.Counters.AdmittedArrivals = 8
+	if err := aggregator.Accept("worker-a", oldPartial); err != nil {
+		t.Fatalf("Accept(old revision partial) error = %v", err)
+	}
+	sequence++
+	newPartial := metricsDeltaForTest(t, "worker-a", 2, sequence, activation, boundary, nil)
+	newPartial.Counters.AdmittedArrivals = 2
+	if err := aggregator.Accept("worker-a", newPartial); err != nil {
+		t.Fatalf("Accept(new revision partial) error = %v", err)
+	}
+
+	got := aggregator.ArrivalWindow(started, boundary)
+	if got.Admitted != 50 || got.Unmet != 0 || !got.Complete {
+		t.Fatalf("ArrivalWindow() = %+v, want admitted=50 unmet=0 complete=true", got)
+	}
+	if len(aggregator.arrivalRecords) != 0 {
+		t.Fatalf("arrival record count = %d, want exact records consumed", len(aggregator.arrivalRecords))
+	}
+}
+
+func TestMetricsAggregatorRevisionActiveUntilUsesEarliestQueuedActivation(t *testing.T) {
+	started := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	deadline := started.Add(10 * time.Second)
+	aggregator := newMetricsAggregator("run-rapid-revisions")
+
+	revisionOne := metricsAssignment("run-rapid-revisions", 1, 1, started, deadline)
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{"worker-a": revisionOne})
+	revisionTwo := metricsAssignment("run-rapid-revisions", 2, 1, started, deadline)
+	revisionTwo.ActivatesAt = timestamppb.New(started.Add(5 * time.Second))
+	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{"worker-a": revisionTwo})
+	revisionThree := metricsAssignment("run-rapid-revisions", 3, 1, started, deadline)
+	revisionThree.ActivatesAt = timestamppb.New(started.Add(6 * time.Second))
+	aggregator.RecordAssignments(3, map[string]*loadtestv1.LoadAssignment{"worker-a": revisionThree})
+
+	if got := aggregator.revisionActiveUntil(1, deadline); !got.Equal(started.Add(5 * time.Second)) {
+		t.Fatalf("revisionActiveUntil(1) = %v, want first queued activation at +5s", got)
+	}
+	if got := aggregator.revisionActiveUntil(2, deadline); !got.Equal(started.Add(6 * time.Second)) {
+		t.Fatalf("revisionActiveUntil(2) = %v, want next queued activation at +6s", got)
+	}
+}
+
+func TestMetricsAggregatorRevisionActiveUntilIsIndependentOfWorkerMapIteration(t *testing.T) {
+	started := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	deadline := started.Add(10 * time.Second)
+	aggregator := newMetricsAggregator("run-map-order")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-map-order", 1, 1, started, deadline),
+	})
+	early := metricsAssignment("run-map-order", 2, 1, started, deadline)
+	early.ActivatesAt = timestamppb.New(started.Add(5 * time.Second))
+	late := metricsAssignment("run-map-order", 2, 1, started, deadline)
+	late.ActivatesAt = timestamppb.New(started.Add(7 * time.Second))
+	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{
+		"worker-early": early,
+		"worker-late":  late,
+	})
+
+	for range 1_000 {
+		if got := aggregator.revisionActiveUntil(1, deadline); !got.Equal(started.Add(5 * time.Second)) {
+			t.Fatalf("revisionActiveUntil(1) = %v, want deterministic earliest activation at +5s", got)
+		}
+	}
+}
+
 func TestMetricsAggregatorReturnsNextSequenceForStableWorker(t *testing.T) {
 	started := time.Now()
 	deadline := started.Add(time.Second)
@@ -209,12 +552,12 @@ func TestMetricsAggregatorAllowsIntervalGapAcrossZeroLoadRevision(t *testing.T) 
 	if err := aggregator.Accept("worker-a", first); err != nil {
 		t.Fatalf("Accept(revision 1) error = %v", err)
 	}
-	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{
-		"worker-a": metricsAssignment("run-13", 2, 0, started, deadline),
-	})
-	aggregator.RecordAssignments(3, map[string]*loadtestv1.LoadAssignment{
-		"worker-a": metricsAssignment("run-13", 3, 1, started, deadline),
-	})
+	idle := metricsAssignment("run-13", 2, 0, started, deadline)
+	idle.ActivatesAt = timestamppb.New(started.Add(time.Second))
+	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{"worker-a": idle})
+	resumed := metricsAssignment("run-13", 3, 1, started, deadline)
+	resumed.ActivatesAt = timestamppb.New(started.Add(3 * time.Second))
+	aggregator.RecordAssignments(3, map[string]*loadtestv1.LoadAssignment{"worker-a": resumed})
 	second := metricsDeltaForTest(t, "worker-a", 3, 2, started.Add(3*time.Second), started.Add(4*time.Second), []protocol.Result{
 		{Latency: 20 * time.Millisecond, StatusCode: 200},
 	})
@@ -240,9 +583,9 @@ func TestMetricsAggregatorRejectsIntervalGapAcrossActiveRevisions(t *testing.T) 
 	if err := aggregator.Accept("worker-a", first); err != nil {
 		t.Fatalf("Accept(revision 1) error = %v", err)
 	}
-	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{
-		"worker-a": metricsAssignment("run-13", 2, 1, started, deadline),
-	})
+	replacement := metricsAssignment("run-13", 2, 1, started, deadline)
+	replacement.ActivatesAt = timestamppb.New(started.Add(time.Second))
+	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{"worker-a": replacement})
 	second := metricsDeltaForTest(t, "worker-a", 2, 2, started.Add(3*time.Second), started.Add(4*time.Second), []protocol.Result{
 		{Latency: 20 * time.Millisecond, StatusCode: 200},
 	})
@@ -319,9 +662,9 @@ func TestMetricsAggregatorClosesReplacedRevisionAtExactBoundary(t *testing.T) {
 	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
 		"worker-a": metricsAssignment("run-13", 1, 1, started, deadline),
 	})
-	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{
-		"worker-a": metricsAssignment("run-13", 2, 1, started, deadline),
-	})
+	replacement := metricsAssignment("run-13", 2, 1, started, deadline)
+	replacement.ActivatesAt = timestamppb.New(started.Add(time.Second))
+	aggregator.RecordAssignments(2, map[string]*loadtestv1.LoadAssignment{"worker-a": replacement})
 	closing := metricsDeltaForTest(t, "worker-a", 1, 1, started, started.Add(time.Second), []protocol.Result{
 		{Latency: 10 * time.Millisecond, StatusCode: 200},
 	}, true)
@@ -388,6 +731,78 @@ func TestMetricsAggregatorAddsRecoveryUnmetDemandWithoutLosingHistory(t *testing
 	next, err := aggregator.NextSequence("worker-a")
 	if err != nil || next != 2 {
 		t.Fatalf("NextSequence() = (%d, %v), want (2, nil)", next, err)
+	}
+}
+
+func TestMetricsAggregatorRecordsRecoveryDemandInExactArrivalWindow(t *testing.T) {
+	started := time.Now()
+	boundary := started.Add(time.Second)
+	aggregator := newMetricsAggregator("run-recovery-window")
+
+	if err := aggregator.AddRecoveryUnmetDemandForWindow("worker-a", started, boundary, 17); err != nil {
+		t.Fatalf("AddRecoveryUnmetDemandForWindow() error = %v", err)
+	}
+	got := aggregator.ArrivalWindow(started, boundary)
+	if got.Unmet != 17 || !got.Complete {
+		t.Fatalf("ArrivalWindow() = %+v, want unmet=17 complete=true", got)
+	}
+	if fleet := aggregator.Snapshot(); fleet.UnmetDemand != 17 {
+		t.Fatalf("Snapshot().UnmetDemand = %d, want 17", fleet.UnmetDemand)
+	}
+	if len(aggregator.arrivalRecords) != 0 {
+		t.Fatalf("arrival record count = %d, want recovery record pruned", len(aggregator.arrivalRecords))
+	}
+}
+
+func TestMetricsAggregatorArrivalWindowIsRaceSafeAndBounded(t *testing.T) {
+	started := time.Now()
+	deadline := started.Add(32 * time.Second)
+	aggregator := newMetricsAggregator("run-13")
+	aggregator.RecordAssignments(1, map[string]*loadtestv1.LoadAssignment{
+		"worker-a": metricsAssignment("run-13", 1, 1, started, deadline),
+	})
+	deltas := make([]*loadtestv1.MetricsDelta, 0, 32)
+	for sequence := uint64(1); sequence <= 32; sequence++ {
+		intervalStart := started.Add(time.Duration(sequence-1) * time.Second)
+		intervalEnd := intervalStart.Add(time.Second)
+		delta := metricsDeltaForTest(t, "worker-a", 1, sequence, intervalStart, intervalEnd, nil, sequence == 32)
+		delta.Counters.AdmittedArrivals = 1
+		deltas = append(deltas, delta)
+	}
+
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		for index, delta := range deltas {
+			if err := aggregator.Accept("worker-a", delta); err != nil {
+				t.Errorf("Accept(sequence=%d) error = %v", index+1, err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wait.Done()
+		for boundary := started.Add(time.Second); !boundary.After(deadline); boundary = boundary.Add(time.Second) {
+			aggregator.ArrivalWindow(boundary.Add(-time.Second), boundary)
+			aggregator.Snapshot()
+		}
+	}()
+	wait.Wait()
+
+	aggregator.ArrivalWindow(started, deadline)
+	if len(aggregator.arrivalRecords) != 0 {
+		t.Fatalf("arrival record count = %d, want bounded history after final prune", len(aggregator.arrivalRecords))
+	}
+}
+
+func TestMetricsAggregatorRecordsInfrastructureViolation(t *testing.T) {
+	aggregator := newMetricsAggregator("run-infrastructure")
+	aggregator.RecordInfrastructureViolation("scale worker fleet: quota exceeded")
+
+	violations := aggregator.Violations()
+	if len(violations) != 1 || violations[0] != "scale worker fleet: quota exceeded" {
+		t.Fatalf("Violations() = %v, want one infrastructure failure", violations)
 	}
 }
 

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -10,13 +11,18 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/marcuslin123/load-tester/internal/autoscale"
 	loadconfig "github.com/marcuslin123/load-tester/internal/config"
+	"github.com/marcuslin123/load-tester/internal/fleet"
+	"github.com/marcuslin123/load-tester/internal/fleet/docker"
 	"github.com/marcuslin123/load-tester/internal/metrics"
+	"github.com/marcuslin123/load-tester/internal/orchestrator"
 	"github.com/marcuslin123/load-tester/internal/report"
 	"google.golang.org/grpc"
 )
@@ -34,6 +40,21 @@ func TestParseOptionsRequiresConfigAndDefaultsAddress(t *testing.T) {
 	}
 	if options.metricsAddress != ":9091" {
 		t.Errorf("metrics address = %q, want :9091", options.metricsAddress)
+	}
+	if options.fleetDriver != fleetDriverManual {
+		t.Errorf("fleet driver = %q, want %q", options.fleetDriver, fleetDriverManual)
+	}
+	if options.workerStartupTimeout != 30*time.Second {
+		t.Errorf("worker startup timeout = %s, want 30s", options.workerStartupTimeout)
+	}
+	if options.workerImage != "load-tester-worker:latest" {
+		t.Errorf("worker image = %q, want load-tester-worker:latest", options.workerImage)
+	}
+	if options.dockerNetwork != "bridge" {
+		t.Errorf("Docker network = %q, want bridge", options.dockerNetwork)
+	}
+	if options.workerOrchestratorAddress != "host.docker.internal:9090" {
+		t.Errorf("worker orchestrator address = %q, want host.docker.internal:9090", options.workerOrchestratorAddress)
 	}
 }
 
@@ -143,6 +164,216 @@ func TestParseOptionsRejectsMissingConfigAndPositionalArguments(t *testing.T) {
 				t.Fatalf("parseOptions() error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestParseOptionsRejectsInvalidManagedFleetFlags(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "unknown driver", args: []string{"-config", "loadtest.yaml", "-fleet-driver", "unknown"}, want: "unknown fleet driver"},
+		{name: "zero startup timeout", args: []string{"-config", "loadtest.yaml", "-worker-startup-timeout", "0s"}, want: "worker-startup-timeout"},
+		{name: "negative CPU limit", args: []string{"-config", "loadtest.yaml", "-docker-worker-cpus", "-0.25"}, want: "docker-worker-cpus"},
+		{name: "NaN CPU limit", args: []string{"-config", "loadtest.yaml", "-docker-worker-cpus", "NaN"}, want: "docker-worker-cpus"},
+		{name: "sub-NanoCPU limit", args: []string{"-config", "loadtest.yaml", "-docker-worker-cpus", "0.5e-9"}, want: "docker-worker-cpus"},
+		{name: "overflowing CPU limit", args: []string{"-config", "loadtest.yaml", "-docker-worker-cpus", "10000000000"}, want: "docker-worker-cpus"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := parseOptions(test.args)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("parseOptions() error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestWaitForListenersReturnsEarlyServerFailure(t *testing.T) {
+	events := make(chan lifecycleEvent, 1)
+	events <- lifecycleEvent{kind: lifecycleHTTPStopped, err: errors.New("serve failed")}
+
+	err := waitForListeners(context.Background(), make(chan struct{}), make(chan struct{}), events)
+	if err == nil || !strings.Contains(err.Error(), "serve HTTP: serve failed") {
+		t.Fatalf("waitForListeners() error = %v, want early HTTP failure", err)
+	}
+}
+
+func TestValidateFleetSelectionRejectsManualAutoscale(t *testing.T) {
+	err := validateFleetSelection(cliOptions{fleetDriver: fleetDriverManual}, loadconfig.Config{
+		Fleet: loadconfig.Fleet{Autoscale: true},
+	})
+	if err == nil || !strings.Contains(err.Error(), "manual fleet driver") {
+		t.Fatalf("validateFleetSelection() error = %v, want manual autoscale rejection", err)
+	}
+}
+
+func TestNewFleetManagerPropagatesDockerOptions(t *testing.T) {
+	want := docker.Options{
+		RunID:               "run-123",
+		Image:               "load-tester-worker:test",
+		Network:             "load-test-network",
+		OrchestratorAddress: "host.docker.internal:19090",
+		AddHostGateway:      true,
+		WorkerCPUs:          0.25,
+	}
+	manager := &fleetManagerStub{}
+	gotManager, err := newFleetManager(context.Background(), cliOptions{
+		fleetDriver:               fleetDriverDocker,
+		workerImage:               want.Image,
+		dockerNetwork:             want.Network,
+		workerOrchestratorAddress: want.OrchestratorAddress,
+		dockerAddHostGateway:      want.AddHostGateway,
+		dockerWorkerCPUs:          want.WorkerCPUs,
+	}, want.RunID, func(_ context.Context, got docker.Options) (fleet.FleetManager, error) {
+		if got != want {
+			t.Fatalf("Docker options = %+v, want %+v", got, want)
+		}
+		return manager, nil
+	})
+	if err != nil {
+		t.Fatalf("newFleetManager() error = %v", err)
+	}
+	if gotManager != manager {
+		t.Fatalf("manager = %T, want returned Docker manager", gotManager)
+	}
+}
+
+func TestNewFleetManagerReportsDockerCreationFailure(t *testing.T) {
+	wantErr := errors.New("Docker unavailable")
+	_, err := newFleetManager(context.Background(), cliOptions{fleetDriver: fleetDriverDocker}, "run-123", func(context.Context, docker.Options) (fleet.FleetManager, error) {
+		return nil, wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("newFleetManager() error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestCleanupManagedFleetAttemptsEveryStepAfterFailures(t *testing.T) {
+	scaleErr := errors.New("scale down failed")
+	teardownErr := errors.New("teardown failed")
+	closeErr := errors.New("close failed")
+	manager := &cleanupFleetManager{
+		scaleErr:    scaleErr,
+		teardownErr: teardownErr,
+		closeErr:    closeErr,
+	}
+
+	err := cleanupManagedFleet(manager, 50*time.Millisecond)
+	if !errors.Is(err, scaleErr) || !errors.Is(err, teardownErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("cleanupManagedFleet() error = %v, want every cleanup error", err)
+	}
+	if got, want := manager.calls, []string{"scale:0", "teardown", "close"}; !slices.Equal(got, want) {
+		t.Fatalf("cleanup calls = %v, want %v", got, want)
+	}
+	if !manager.contextWasBounded {
+		t.Fatal("cleanup did not use a fresh bounded context")
+	}
+}
+
+func TestCleanupManagedFleetGivesTeardownIndependentTimeout(t *testing.T) {
+	manager := &cleanupFleetManager{blockScaleUntilCanceled: true}
+
+	err := cleanupManagedFleet(manager, 10*time.Millisecond)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cleanupManagedFleet() error = %v, want scale deadline", err)
+	}
+	if manager.teardownContextErr != nil {
+		t.Fatalf("Teardown() context error = %v, want fresh active context", manager.teardownContextErr)
+	}
+	if got, want := manager.calls, []string{"scale:0", "teardown", "close"}; !slices.Equal(got, want) {
+		t.Fatalf("cleanup calls = %v, want %v", got, want)
+	}
+}
+
+func TestRunWithOptionsServesBeforePrepareAndCleansUpPrepareFailure(t *testing.T) {
+	grpcAddress := reserveLocalAddress(t)
+	metricsAddress := reserveLocalAddress(t)
+	manager := &cleanupFleetManager{}
+	var control *orchestrator.Server
+	prepareErr := errors.New("workers did not register")
+	controller := managedControllerStub{
+		metrics: metrics.AutoscalerView{Enabled: true, DesiredWorkers: 1},
+		prepare: func(context.Context) error {
+			connection, err := net.DialTimeout("tcp", grpcAddress, coordinatorTestTimeout)
+			if err != nil {
+				t.Fatalf("gRPC listener was not serving before Prepare: %v", err)
+			}
+			if err := connection.Close(); err != nil {
+				t.Fatalf("close gRPC probe: %v", err)
+			}
+			response, err := (&http.Client{Timeout: coordinatorTestTimeout}).Get("http://" + metricsAddress + "/healthz")
+			if err != nil {
+				t.Fatalf("metrics listener was not serving before Prepare: %v", err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode != http.StatusOK {
+				t.Fatalf("health status = %d, want %d", response.StatusCode, http.StatusOK)
+			}
+			return prepareErr
+		},
+	}
+
+	_, err := runWithOptions(
+		context.Background(),
+		cliOptions{
+			address:              grpcAddress,
+			metricsAddress:       metricsAddress,
+			fleetDriver:          fleetDriverDocker,
+			workerStartupTimeout: time.Second,
+		},
+		runnableConstantRateConfig(),
+		"run-prepare-failure",
+		log.New(io.Discard, "", 0),
+		func(context.Context, docker.Options) (fleet.FleetManager, error) { return manager, nil },
+		func(_ fleet.FleetManager, gotControl *orchestrator.Server, _ loadconfig.Config, _ cliOptions, _ *log.Logger) (managedController, error) {
+			control = gotControl
+			return controller, nil
+		},
+	)
+	if !errors.Is(err, prepareErr) {
+		t.Fatalf("runWithOptions() error = %v, want Prepare failure", err)
+	}
+	if got, want := manager.calls, []string{"scale:0", "teardown", "close"}; !slices.Equal(got, want) {
+		t.Fatalf("cleanup calls = %v, want %v", got, want)
+	}
+	if got := control.PrometheusView().Autoscaler; got != controller.metrics {
+		t.Fatalf("autoscaler metrics = %+v, want %+v", got, controller.metrics)
+	}
+}
+
+func TestNewManagedControllerAcceptsFixedConstantVUs(t *testing.T) {
+	control, err := orchestrator.NewServer(orchestrator.Options{HeartbeatInterval: time.Second})
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+	_, err = newManagedController(&fleetManagerStub{}, control, loadconfig.Config{
+		Load:  loadconfig.Load{Model: loadconfig.LoadConstantVUs},
+		Fleet: loadconfig.Fleet{MinWorkers: 1, MaxWorkers: 1},
+	}, cliOptions{workerStartupTimeout: time.Second}, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("newManagedController() error = %v", err)
+	}
+}
+
+func TestRunManagedControllerUsesRunWindowAndRecordsItsFailure(t *testing.T) {
+	startsAt := time.Date(2026, time.August, 15, 12, 0, 0, 0, time.UTC)
+	deadline := startsAt.Add(time.Minute)
+	controllerErr := errors.New("policy evaluation failed")
+	source := &runWindowSourceStub{window: orchestrator.RunWindow{StartsAt: startsAt, Deadline: deadline}}
+	controller := managedControllerStub{
+		run: func(_ context.Context, window autoscale.RunWindow) error {
+			if window.StartsAt != startsAt || window.Deadline != deadline {
+				t.Fatalf("controller window = %+v, want start=%s deadline=%s", window, startsAt, deadline)
+			}
+			return controllerErr
+		},
+	}
+
+	runManagedController(context.Background(), source, controller, log.New(io.Discard, "", 0))
+	if got, want := source.violations, []string{"run autoscale controller: " + controllerErr.Error()}; !slices.Equal(got, want) {
+		t.Fatalf("violations = %v, want %v", got, want)
 	}
 }
 
@@ -745,4 +976,98 @@ func writeOrchestratorConfig(t *testing.T, contents string) string {
 		t.Fatalf("write config: %v", err)
 	}
 	return path
+}
+
+func runnableConstantRateConfig() loadconfig.Config {
+	return loadconfig.Config{
+		Name: "managed-run",
+		Load: loadconfig.Load{
+			Model:       loadconfig.LoadConstantRate,
+			Rate:        1,
+			MaxInFlight: 1,
+			Duration:    time.Second,
+		},
+		Fleet: loadconfig.Fleet{MinWorkers: 1, MaxWorkers: 2},
+	}
+}
+
+type fleetManagerStub struct{}
+
+func (*fleetManagerStub) Scale(context.Context, int) error { return nil }
+
+func (*fleetManagerStub) Replace(context.Context, string) error { return nil }
+
+func (*fleetManagerStub) List(context.Context) ([]fleet.WorkerInfo, error) { return nil, nil }
+
+func (*fleetManagerStub) Teardown(context.Context) error { return nil }
+
+type cleanupFleetManager struct {
+	calls                   []string
+	contextWasBounded       bool
+	scaleErr                error
+	teardownErr             error
+	closeErr                error
+	blockScaleUntilCanceled bool
+	teardownContextErr      error
+}
+
+func (m *cleanupFleetManager) Scale(ctx context.Context, desired int) error {
+	_, m.contextWasBounded = ctx.Deadline()
+	m.calls = append(m.calls, fmt.Sprintf("scale:%d", desired))
+	if m.blockScaleUntilCanceled {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	return m.scaleErr
+}
+
+func (*cleanupFleetManager) Replace(context.Context, string) error { return nil }
+
+func (m *cleanupFleetManager) List(context.Context) ([]fleet.WorkerInfo, error) { return nil, nil }
+
+func (m *cleanupFleetManager) Teardown(ctx context.Context) error {
+	m.calls = append(m.calls, "teardown")
+	m.teardownContextErr = ctx.Err()
+	return m.teardownErr
+}
+
+func (m *cleanupFleetManager) Close() error {
+	m.calls = append(m.calls, "close")
+	return m.closeErr
+}
+
+type managedControllerStub struct {
+	prepare func(context.Context) error
+	run     func(context.Context, autoscale.RunWindow) error
+	metrics metrics.AutoscalerView
+}
+
+func (c managedControllerStub) AutoscalerMetrics() metrics.AutoscalerView { return c.metrics }
+
+func (c managedControllerStub) Prepare(ctx context.Context) error {
+	if c.prepare == nil {
+		return nil
+	}
+	return c.prepare(ctx)
+}
+
+func (c managedControllerStub) Run(ctx context.Context, window autoscale.RunWindow) error {
+	if c.run == nil {
+		return nil
+	}
+	return c.run(ctx, window)
+}
+
+type runWindowSourceStub struct {
+	window     orchestrator.RunWindow
+	windowErr  error
+	violations []string
+}
+
+func (s *runWindowSourceStub) WaitForRunWindow(context.Context) (orchestrator.RunWindow, error) {
+	return s.window, s.windowErr
+}
+
+func (s *runWindowSourceStub) RecordInfrastructureViolation(violation string) {
+	s.violations = append(s.violations, violation)
 }

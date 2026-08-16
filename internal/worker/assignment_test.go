@@ -95,7 +95,8 @@ func validAssignment(runID string, revision, virtualUsers uint64) *loadtestv1.Lo
 			VirtualUsers: virtualUsers,
 			RampUp:       durationpb.New(0),
 		},
-		StartsAt: timestamppb.New(startsAt),
-		Deadline: timestamppb.New(startsAt.Add(30 * time.Second)),
+		StartsAt:    timestamppb.New(startsAt),
+		Deadline:    timestamppb.New(startsAt.Add(30 * time.Second)),
+		ActivatesAt: timestamppb.New(startsAt),
 	}
 }

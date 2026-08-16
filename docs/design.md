@@ -169,8 +169,9 @@ target:
     Content-Type: application/json
   body: '{"item_id": 42}'
 load:
-  model: constant-vus        # or: constant-rate
-  virtual_users: 50000
+  model: constant-rate       # or: constant-vus
+  rate: 50000
+  max_in_flight: 10000
   duration: 5m
   ramp_up: 30s
 fleet:
@@ -206,7 +207,9 @@ each intended arrival from the run start; `ramp_up` linearly increases the rate
 from zero to the configured target. A non-blocking semaphore admits requests up
 to the in-flight limit. Arrivals rejected at that limit increment a separate
 `unmet_demand` counter rather than becoming target failures or waiting in a
-client-side queue. Admitted request latency is measured from intended arrival
+client-side queue. Workers also report exact admitted-arrival counts so the
+orchestrator can distinguish generated requests, max-in-flight rejection, and
+scheduler lag. Admitted request latency is measured from intended arrival
 through response completion.
 
 The open model is where **coordinated omission** must be handled. A naive
@@ -301,29 +304,84 @@ Metric reporting must never block load generation.
 
 Per-worker capacity is not knowable in advance — it depends on instance size,
 target latency, and response size. The orchestrator therefore *measures* it.
+Fleet autoscaling is valid only for `constant-rate`; configuration rejects it
+for `constant-vus`.
 
 Control loop:
 
-1. **Provision** `ceil(target_load / assumed_per_worker_capacity)` workers, with a
-   floor of `min_workers`.
-2. **Every 5 seconds, evaluate saturation per worker:** is its *achieved* rate
-   meeting its *assigned* rate? This ratio is the only saturation signal in
-   Layer 1. Per-worker CPU and memory are a stretch goal (§1) and are
-   deliberately not required here — achieved-versus-assigned rate is sufficient
-   to detect a saturated worker, and it needs no host metrics plumbing.
-3. **Scale up** if fleet-wide achieved throughput is below 90% of target for two
-   consecutive intervals and `workers < max_workers`. Scale by the deficit ratio,
-   not one worker at a time.
-4. **Rebalance** on any membership change: recompute per-worker slices and push
-   new assignments down the existing streams.
-5. **Cooldown** of 15 seconds between scaling actions to prevent thrash — new
-   containers need time to warm up.
-6. **Scale to zero** on test completion.
+1. **Provision** `min_workers`; capacity is measured rather than assumed.
+   Initial provisioning failure is a setup failure. Docker running state and
+   gRPC readiness remain separate, so the orchestrator waits up to a
+   configurable worker startup timeout (30 seconds by default) for registration.
+2. **Every 5 seconds, evaluate the exact ramp window.** Expected arrivals come
+   from the absolute schedule. Active workers shard one global arrival sequence,
+   so uneven rate splits still produce each fleet-wide deadline exactly once.
+   The controller allows three seconds for delivery, then reads only
+   deltas whose declared interval ended by the evaluation boundary; late data
+   cannot leak into a later window. Scheduler coverage is
+   `(admitted_arrivals + unmet_demand) / expected_arrivals`: admitted arrivals
+   became requests, while unmet demand accounts for arrivals that could not.
+   During the healthy-fleet windows used for scaling, unmet demand represents
+   global concurrency rejection and any remaining deficit is worker scheduler
+   lag. Worker-loss windows are handled separately by replacement reconciliation.
+   A delayed scheduler dispatches at most one stale arrival before advancing to
+   the first current deadline owned by its shard. It does not burst through every
+   missed deadline: those omissions remain scheduler lag, while burst catch-up
+   would distort both the configured rate and later control windows.
+   Response completions are not a fleet-capacity signal because a slow target
+   must not cause worker scaling. Final evaluation compares total expected
+   arrivals with total admitted plus already-recorded unmet demand exactly once,
+   so load the fleet never generated fails the result without mutating the
+   controller's cumulative inputs.
+3. **Replace before adding capacity.** Reconcile the current desired count and
+   wait for replacement workers to register before evaluating a fresh capacity
+   window. Missed arrivals remain unmet demand, but a temporary worker death
+   does not permanently inflate the desired fleet. The provider replaces the
+   exact stable worker ID even when its old container is still running but its
+   gRPC session is gone. Previously registered workers are replaced immediately;
+   newly created workers retain the normal startup timeout before replacement.
+4. **Scale up** when scheduler coverage is below 90% for two consecutive
+   intervals and the fleet is below `max_workers`. The 90% action threshold
+   tolerates brief scheduling and reporting noise; any unmet demand still fails
+   the final result. Compute the deficit-ratio count, cap one action at twice the
+   current count, and clamp it to `max_workers`. Zero coverage uses the same
+   two-times fallback.
+5. **Rebalance** on membership change and start a 15-second cooldown only after
+   a successful capacity increase. New workers receive the remaining absolute
+   run window rather than restarting the test. Future revisions queue in
+   activation order. At activation, the old revision stops scheduling without
+   canceling admitted requests; those requests drain into a revision-specific
+   collector while the new revision starts immediately. Metric sequence numbers
+   remain ordered, but a ready newer-revision delta may precede a late old final
+   delta so one stalled request cannot hide current autoscaler windows.
+6. **Do not scale down during a run.** The supported load shape only ramps up
+   and then remains constant; it does not fluctuate downward. Removing workers
+   would add churn without following a real demand reduction. Scale directly to
+   zero during teardown.
+
+`max_in_flight` remains a global test limit divided across active workers, so
+adding workers does not raise total allowed concurrency. Max-in-flight rejection
+is reported as unmet demand rather than treated as a scaling trigger; raising
+that user-selected ceiling is the remedy when it is too low. Horizontal scaling
+instead distributes scheduling, connection handling, and response processing
+across more worker processes.
+
+The orchestrator selects `manual` or `docker` fleet ownership through operational
+flags rather than the test YAML. Manual mode accepts externally started workers
+and cannot be combined with autoscaling. A Docker-managed fixed run reconciles
+exactly `min_workers`; an autoscaled run starts there and grows as needed. Piece
+20 adds a Kubernetes driver behind the same interface.
+
+Mid-run fleet-manager errors preserve the existing workers, become final-result
+violations, and retry at the next evaluation without starting cooldown. The
+controller exports desired and registered workers, expected and admitted rates,
+scheduler coverage, deficient intervals, scale actions, and fleet errors. Logs
+include the inputs and reason for each decision.
 
 ### Two kinds of autoscaling, deliberately both present
 
-- **Fleet autoscaling (this platform).** Orchestrator-driven, reacting to a load
-  deficit — the difference between assigned and achieved request rate.
+- **Fleet autoscaling (this platform).** Orchestrator-driven, reacting when the
+  worker fleet cannot process the configured arrival schedule fast enough.
 - **Target autoscaling (observed).** The target app runs under a Kubernetes HPA.
   Generating sustained load causes the HPA to add pods, and the platform's
   metrics capture the target's latency recovering as it scales. This demonstrates
@@ -414,7 +472,8 @@ backoff while Prometheus and Grafana remain available for inspection.
 | Worker dies mid-test | Stream breaks -> orchestrator retains complete deltas, records an integrity failure, and redistributes the load immediately. Later fleet drivers may provision a replacement. |
 | Worker hangs (no activity) | Three missed heartbeat intervals -> close the stream and use the same recovery path as a broken connection. |
 | Target unreachable at start | Pre-flight single request; abort with a clear error rather than reporting a 100% error rate. |
-| Scale-up fails (quota/capacity) | Log the failure, continue at current fleet size, and record that target load was unmet. Never silently report as if it succeeded. |
+| Scale-up fails (quota/capacity) | Log the failure, continue at current fleet size, record a result violation, and retry at the next evaluation. Never silently report success. |
+| Generated schedule overlaps | Final admitted arrivals above the absolute schedule -> fail the result as an integrity violation. |
 | Orchestrator dies | Test is lost. Accepted for Layer 1 — see §11. |
 | Thresholds violated | Non-zero exit code, making the tool usable in CI. |
 
@@ -423,8 +482,9 @@ backoff while Prometheus and Grafana remain available for inspection.
 ## 9. Testing strategy
 
 **Unit.** Histogram merge correctness; percentile math; load-slice distribution;
-autoscaler decisions (table-driven against synthetic saturation inputs); rate
-scheduler timing under simulated clock.
+autoscaler decisions (table-driven against synthetic saturation inputs);
+controller timing and fleet failures with fake time and a fake manager; exact
+admitted-arrival accounting; rate scheduler timing under simulated clock.
 
 **Integration.** In-process orchestrator plus N in-process workers against
 `cmd/target` configured with known fixed latency. Assert that measured p99
@@ -440,6 +500,11 @@ collector, so merged and directly aggregated percentiles must match exactly.
 
 **End-to-end.** `docker compose up`, run a test, assert Prometheus contains the
 expected series.
+
+The Piece 19 Docker test applies an optional per-worker CPU limit so one initial
+worker is reproducibly under-provisioned. It verifies scale-up,
+scheduler-coverage recovery, and complete teardown without depending on the host
+being naturally saturated.
 
 **Fault injection.** `docker kill` a worker mid-test; assert the run completes and
 the fleet self-heals.
@@ -689,6 +754,8 @@ separately decides whether enough workers registered, which keeps infrastructure
 state separate from application connectivity. A partially failed scale-up rolls
 back only the containers created by that call. Scale-down and teardown attempt
 every requested removal and join any errors. Driver operations are serialized;
+`Replace` recreates one exact stable worker slot. Managed cleanup gives
+scale-to-zero and teardown separate bounded contexts before closing the client.
 teardown is idempotent, permanently closes scaling with `ErrClosed`, and leaves
 `List` available for an empty post-cleanup observation.
 

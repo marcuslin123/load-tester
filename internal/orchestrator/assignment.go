@@ -61,6 +61,9 @@ func splitLoad(load config.Load, workerIDs []string) (map[string]*loadtestv1.Loa
 			if index < active {
 				result[workerID].Rate = uint64(rates[index])
 				result[workerID].MaxInFlight = uint64(limits[index])
+				result[workerID].GlobalRate = uint64(load.Rate)
+				result[workerID].ScheduleShardIndex = uint64(index)
+				result[workerID].ScheduleShardCount = uint64(active)
 			}
 		}
 	default:

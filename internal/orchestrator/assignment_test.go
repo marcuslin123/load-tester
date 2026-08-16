@@ -50,6 +50,9 @@ func TestSplitLoadCapsOpenModelWorkersByMaxInFlight(t *testing.T) {
 	assertLoadSlice(t, slices["worker-a"], loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE, 0, 5, 1, 2*time.Second)
 	assertLoadSlice(t, slices["worker-b"], loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE, 0, 5, 1, 2*time.Second)
 	assertLoadSlice(t, slices["worker-c"], loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_RATE, 0, 0, 0, 2*time.Second)
+	assertGlobalSchedule(t, slices["worker-a"], 10, 0, 2)
+	assertGlobalSchedule(t, slices["worker-b"], 10, 1, 2)
+	assertNoGlobalSchedule(t, slices["worker-c"])
 }
 
 func TestSplitLoadLeavesSurplusClosedModelWorkersIdle(t *testing.T) {
@@ -64,6 +67,24 @@ func TestSplitLoadLeavesSurplusClosedModelWorkersIdle(t *testing.T) {
 	assertLoadSlice(t, slices["worker-a"], loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_VUS, 1, 0, 0, 0)
 	assertLoadSlice(t, slices["worker-b"], loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_VUS, 1, 0, 0, 0)
 	assertLoadSlice(t, slices["worker-c"], loadtestv1.LoadModel_LOAD_MODEL_CONSTANT_VUS, 0, 0, 0, 0)
+}
+
+func assertGlobalSchedule(t *testing.T, slice *loadtestv1.LoadSlice, rate, index, count uint64) {
+	t.Helper()
+	if got := slice.GetGlobalRate(); got != rate {
+		t.Errorf("global rate = %d, want %d", got, rate)
+	}
+	if got := slice.GetScheduleShardIndex(); got != index {
+		t.Errorf("schedule shard index = %d, want %d", got, index)
+	}
+	if got := slice.GetScheduleShardCount(); got != count {
+		t.Errorf("schedule shard count = %d, want %d", got, count)
+	}
+}
+
+func assertNoGlobalSchedule(t *testing.T, slice *loadtestv1.LoadSlice) {
+	t.Helper()
+	assertGlobalSchedule(t, slice, 0, 0, 0)
 }
 
 func assertLoadSlice(

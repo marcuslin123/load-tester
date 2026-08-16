@@ -23,7 +23,7 @@ load:
 fleet:
   min_workers: 2
   max_workers: 30
-  autoscale: true
+  autoscale: false
 thresholds:
   p99_latency: 500ms
   error_rate: 0.01
@@ -71,14 +71,38 @@ func TestParseReadsExampleConfig(t *testing.T) {
 	if cfg.Fleet.MaxWorkers != 30 {
 		t.Fatalf("Fleet.MaxWorkers = %d, want 30", cfg.Fleet.MaxWorkers)
 	}
-	if !cfg.Fleet.Autoscale {
-		t.Fatalf("Fleet.Autoscale = false, want true")
+	if cfg.Fleet.Autoscale {
+		t.Fatalf("Fleet.Autoscale = true, want false")
 	}
 	if cfg.Thresholds.P99Latency != 500*time.Millisecond {
 		t.Fatalf("Thresholds.P99Latency = %s, want 500ms", cfg.Thresholds.P99Latency)
 	}
 	if cfg.Thresholds.ErrorRate != 0.01 {
 		t.Fatalf("Thresholds.ErrorRate = %f, want 0.01", cfg.Thresholds.ErrorRate)
+	}
+}
+
+func TestParseAcceptsAutoscalingForConstantRate(t *testing.T) {
+	cfg, err := Parse(strings.NewReader(`
+name: open-autoscale
+target:
+  protocol: http
+  url: http://target:8080/echo
+load:
+  model: constant-rate
+  rate: 1000
+  max_in_flight: 500
+  duration: 30s
+fleet:
+  min_workers: 1
+  max_workers: 4
+  autoscale: true
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if !cfg.Fleet.Autoscale || cfg.Load.Model != LoadConstantRate {
+		t.Fatalf("config = %+v, want constant-rate autoscaling", cfg)
 	}
 }
 
@@ -339,6 +363,24 @@ fleet:
   max_workers: 1
 `,
 			want: "load.max_in_flight",
+		},
+		{
+			name: "constant vus rejects fleet autoscale",
+			yaml: `
+name: closed-autoscale
+target:
+  protocol: http
+  url: http://target:8080/echo
+load:
+  model: constant-vus
+  virtual_users: 10
+  duration: 10s
+fleet:
+  min_workers: 1
+  max_workers: 2
+  autoscale: true
+`,
+			want: "fleet.autoscale",
 		},
 		{
 			name: "unknown field",

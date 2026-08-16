@@ -4,6 +4,7 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -131,6 +132,69 @@ func TestPrometheusCollectorExportsDisconnectedWorkerWithoutDeltas(t *testing.T)
 	assertHistogram(t, byName["loadtester_worker_request_duration_seconds"], labels, 0, map[float64]uint64{0.005: 0, 10: 0})
 }
 
+func TestPrometheusCollectorExportsManagedAutoscalerMetrics(t *testing.T) {
+	t.Parallel()
+
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(NewPrometheusCollector(prometheusSourceStub{
+		autoscaler: AutoscalerView{
+			Enabled:            true,
+			DesiredWorkers:     3,
+			ExpectedRate:       1000,
+			AdmittedRate:       840,
+			SchedulerCoverage:  0.84,
+			DeficientIntervals: 2,
+			ScaleActions:       1,
+			Errors:             0,
+		},
+	}, RunInfo{RunID: "run-managed", Name: "managed", Model: "constant-rate"}))
+
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error = %v", err)
+	}
+	byName := metricFamiliesByName(families)
+	want := map[string]struct {
+		metricType dto.MetricType
+		value      float64
+	}{
+		"loadtester_desired_workers":                         {metricType: dto.MetricType_GAUGE, value: 3},
+		"loadtester_autoscaler_expected_requests_per_second": {metricType: dto.MetricType_GAUGE, value: 1000},
+		"loadtester_autoscaler_admitted_requests_per_second": {metricType: dto.MetricType_GAUGE, value: 840},
+		"loadtester_autoscaler_scheduler_coverage_ratio":     {metricType: dto.MetricType_GAUGE, value: 0.84},
+		"loadtester_autoscaler_deficient_intervals":          {metricType: dto.MetricType_GAUGE, value: 2},
+		"loadtester_autoscaler_scale_actions_total":          {metricType: dto.MetricType_COUNTER, value: 1},
+		"loadtester_autoscaler_errors_total":                 {metricType: dto.MetricType_COUNTER, value: 0},
+	}
+	for name, expected := range want {
+		family := byName[name]
+		if family == nil {
+			t.Errorf("missing metric family %q", name)
+			continue
+		}
+		if got := family.GetType(); got != expected.metricType {
+			t.Errorf("%s type = %s, want %s", name, got, expected.metricType)
+		}
+		assertMetricValue(t, family, nil, expected.value)
+	}
+}
+
+func TestPrometheusCollectorOmitsAutoscalerMetricsInManualMode(t *testing.T) {
+	t.Parallel()
+
+	registry := prometheus.NewPedanticRegistry()
+	registry.MustRegister(NewPrometheusCollector(prometheusSourceStub{}, RunInfo{}))
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("Gather() error = %v", err)
+	}
+	for name := range metricFamiliesByName(families) {
+		if strings.HasPrefix(name, "loadtester_autoscaler_") || name == "loadtester_desired_workers" {
+			t.Fatalf("manual mode exported controller-only metric %q", name)
+		}
+	}
+}
+
 func TestPrometheusLatencyBucketExcludesObservationAboveFixedBound(t *testing.T) {
 	t.Parallel()
 
@@ -157,9 +221,10 @@ func TestPrometheusCollectorReadsOneSourceViewPerCollection(t *testing.T) {
 }
 
 type prometheusSourceStub struct {
-	fleet   Snapshot
-	workers map[string]Snapshot
-	active  []string
+	fleet      Snapshot
+	workers    map[string]Snapshot
+	active     []string
+	autoscaler AutoscalerView
 }
 
 func (s prometheusSourceStub) PrometheusView() PrometheusView {
@@ -167,6 +232,7 @@ func (s prometheusSourceStub) PrometheusView() PrometheusView {
 		Fleet:           s.fleet,
 		Workers:         s.workers,
 		ActiveWorkerIDs: s.active,
+		Autoscaler:      s.autoscaler,
 	}
 }
 

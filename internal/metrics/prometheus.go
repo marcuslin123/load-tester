@@ -37,6 +37,19 @@ type PrometheusView struct {
 	Fleet           Snapshot
 	Workers         map[string]Snapshot
 	ActiveWorkerIDs []string
+	Autoscaler      AutoscalerView
+}
+
+// AutoscalerView is one immutable managed-fleet controller snapshot.
+type AutoscalerView struct {
+	Enabled            bool
+	DesiredWorkers     int
+	ExpectedRate       float64
+	AdmittedRate       float64
+	SchedulerCoverage  float64
+	DeficientIntervals int
+	ScaleActions       uint64
+	Errors             uint64
 }
 
 // PrometheusSource supplies one consistent cumulative metrics view per scrape.
@@ -73,6 +86,13 @@ type PrometheusCollector struct {
 	workerDroppedSamples *prometheus.Desc
 	workerUnmetDemand    *prometheus.Desc
 	workerDuration       *prometheus.Desc
+	desiredWorkers       *prometheus.Desc
+	autoscaleExpectedRPS *prometheus.Desc
+	autoscaleAdmittedRPS *prometheus.Desc
+	autoscaleCoverage    *prometheus.Desc
+	autoscaleDeficits    *prometheus.Desc
+	autoscaleActions     *prometheus.Desc
+	autoscaleErrors      *prometheus.Desc
 }
 
 // NewPrometheusCollector creates a pull collector over cumulative source snapshots.
@@ -131,6 +151,27 @@ func NewPrometheusCollector(source PrometheusSource, info RunInfo) *PrometheusCo
 		workerDuration: prometheus.NewDesc(
 			"loadtester_worker_request_duration_seconds", "Request duration distribution by worker.", []string{"worker_id"}, nil,
 		),
+		desiredWorkers: prometheus.NewDesc(
+			"loadtester_desired_workers", "Number of workers requested from the managed fleet.", nil, nil,
+		),
+		autoscaleExpectedRPS: prometheus.NewDesc(
+			"loadtester_autoscaler_expected_requests_per_second", "Scheduled request rate in the latest autoscaler window.", nil, nil,
+		),
+		autoscaleAdmittedRPS: prometheus.NewDesc(
+			"loadtester_autoscaler_admitted_requests_per_second", "Admitted request rate in the latest autoscaler window.", nil, nil,
+		),
+		autoscaleCoverage: prometheus.NewDesc(
+			"loadtester_autoscaler_scheduler_coverage_ratio", "Fraction of scheduled arrivals handled or rejected at the inflight limit.", nil, nil,
+		),
+		autoscaleDeficits: prometheus.NewDesc(
+			"loadtester_autoscaler_deficient_intervals", "Consecutive autoscaler windows below the scheduler coverage target.", nil, nil,
+		),
+		autoscaleActions: prometheus.NewDesc(
+			"loadtester_autoscaler_scale_actions_total", "Successful autoscaler scale-up actions.", nil, nil,
+		),
+		autoscaleErrors: prometheus.NewDesc(
+			"loadtester_autoscaler_errors_total", "Managed-fleet operation errors observed by the autoscaler.", nil, nil,
+		),
 	}
 }
 
@@ -154,6 +195,13 @@ func (c *PrometheusCollector) Describe(descriptors chan<- *prometheus.Desc) {
 		c.workerDroppedSamples,
 		c.workerUnmetDemand,
 		c.workerDuration,
+		c.desiredWorkers,
+		c.autoscaleExpectedRPS,
+		c.autoscaleAdmittedRPS,
+		c.autoscaleCoverage,
+		c.autoscaleDeficits,
+		c.autoscaleActions,
+		c.autoscaleErrors,
 	} {
 		descriptors <- descriptor
 	}
@@ -169,6 +217,9 @@ func (c *PrometheusCollector) Collect(metrics chan<- prometheus.Metric) {
 	metrics <- prometheus.MustNewConstMetric(c.runInfo, prometheus.GaugeValue, 1, c.info.RunID, c.info.Name, c.info.Model)
 	metrics <- prometheus.MustNewConstMetric(c.activeWorkers, prometheus.GaugeValue, float64(len(activeWorkerIDs)))
 	c.collectSnapshot(metrics, fleet, "")
+	if view.Autoscaler.Enabled {
+		c.collectAutoscaler(metrics, view.Autoscaler)
+	}
 
 	active := make(map[string]struct{}, len(activeWorkerIDs))
 	workerIDs := make([]string, 0, len(activeWorkerIDs)+len(workerSnapshots))
@@ -195,6 +246,16 @@ func (c *PrometheusCollector) Collect(metrics chan<- prometheus.Metric) {
 		metrics <- prometheus.MustNewConstMetric(c.workerActive, prometheus.GaugeValue, activeValue, workerID)
 		c.collectSnapshot(metrics, workerSnapshots[workerID], workerID)
 	}
+}
+
+func (c *PrometheusCollector) collectAutoscaler(metrics chan<- prometheus.Metric, view AutoscalerView) {
+	metrics <- prometheus.MustNewConstMetric(c.desiredWorkers, prometheus.GaugeValue, float64(view.DesiredWorkers))
+	metrics <- prometheus.MustNewConstMetric(c.autoscaleExpectedRPS, prometheus.GaugeValue, view.ExpectedRate)
+	metrics <- prometheus.MustNewConstMetric(c.autoscaleAdmittedRPS, prometheus.GaugeValue, view.AdmittedRate)
+	metrics <- prometheus.MustNewConstMetric(c.autoscaleCoverage, prometheus.GaugeValue, view.SchedulerCoverage)
+	metrics <- prometheus.MustNewConstMetric(c.autoscaleDeficits, prometheus.GaugeValue, float64(view.DeficientIntervals))
+	metrics <- prometheus.MustNewConstMetric(c.autoscaleActions, prometheus.CounterValue, float64(view.ScaleActions))
+	metrics <- prometheus.MustNewConstMetric(c.autoscaleErrors, prometheus.CounterValue, float64(view.Errors))
 }
 
 func (c *PrometheusCollector) collectSnapshot(metrics chan<- prometheus.Metric, snapshot Snapshot, workerID string) {

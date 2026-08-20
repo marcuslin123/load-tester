@@ -597,6 +597,30 @@ configuration.
 "No orchestrator logic changed" is the claim the interface exists to support, and
 it is worth confirming rather than assuming.
 
+The manifests own a zero-replica worker Deployment; the driver operates its
+`scale` subresource and never creates or deletes declarative infrastructure. The
+orchestrator runs as a one-shot Job with `backoffLimit: 0` and in-cluster
+credentials. Pod names are worker IDs and pod UIDs are provider IDs. Scaling
+waits for the requested number of non-terminating `Running` pods, while gRPC
+registration remains a separate application-level readiness check. Replacement
+uses a UID-protected pod deletion and lets the Deployment create a new member.
+
+Use a narrow fakeable client around `client-go`, bounded conflict retries, and
+context-aware polling. Unit tests cover state mapping, scale reconciliation,
+conflicts, cancellation, UID races, replacement, and terminal teardown. CLI
+tests prove `kubernetes` selects the new provider without changing the
+autoscaler. `kubectl kustomize` validates a reusable base plus kind overlay.
+
+`scripts/test-kind.sh` owns a disposable cluster, loads local images, and mounts
+the unchanged Piece 19 autoscaling scenario. It verifies replicas grow above
+one, scheduler coverage recovers, Prometheus and Grafana work, and teardown
+returns workers to zero. It also exercises positive RBAC permissions through
+the real in-cluster driver, checks forbidden permissions remain denied, and uses
+a server-side dry-run pod deletion to authorize `Replace` without bringing Piece
+22's fault injection forward. The script deletes the cluster by default;
+`KEEP_KIND_CLUSTER=1` preserves it for debugging. Its result separates platform
+failure from a valid passing or failing load-test result.
+
 ### Piece 21 — Observing the target's own autoscaling
 
 **Goal:** The target deployed under a Horizontal Pod Autoscaler, with a run that
@@ -700,6 +724,15 @@ extension via interfaces.
 WebSocket is deliberately *not* next. It is not request/response, so latency and
 requests-per-second would both need redefining, and it would change the metrics
 semantics rather than reuse them (spec §11).
+
+### Stretch goal — Helm package
+
+After the kind and EKS paths are stable, package the platform as a Helm chart if
+it needs to support independently named installations, configurable images and
+resources, optional observability components, or versioned install and rollback
+workflows. Kustomize remains the right Piece 20 tool for the small number of
+environments this repository controls; Helm is deferred until the platform is
+offered as a configurable product for other users.
 
 ---
 

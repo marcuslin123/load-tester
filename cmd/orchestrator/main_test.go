@@ -21,6 +21,7 @@ import (
 	loadconfig "github.com/marcuslin123/load-tester/internal/config"
 	"github.com/marcuslin123/load-tester/internal/fleet"
 	"github.com/marcuslin123/load-tester/internal/fleet/docker"
+	"github.com/marcuslin123/load-tester/internal/fleet/kubernetes"
 	"github.com/marcuslin123/load-tester/internal/metrics"
 	"github.com/marcuslin123/load-tester/internal/orchestrator"
 	"github.com/marcuslin123/load-tester/internal/report"
@@ -55,6 +56,12 @@ func TestParseOptionsRequiresConfigAndDefaultsAddress(t *testing.T) {
 	}
 	if options.workerOrchestratorAddress != "host.docker.internal:9090" {
 		t.Errorf("worker orchestrator address = %q, want host.docker.internal:9090", options.workerOrchestratorAddress)
+	}
+	if options.kubernetesNamespace != "load-tester" {
+		t.Errorf("Kubernetes namespace = %q, want load-tester", options.kubernetesNamespace)
+	}
+	if options.kubernetesWorkerDeployment != "load-tester-worker" {
+		t.Errorf("Kubernetes worker Deployment = %q, want load-tester-worker", options.kubernetesWorkerDeployment)
 	}
 }
 
@@ -179,6 +186,8 @@ func TestParseOptionsRejectsInvalidManagedFleetFlags(t *testing.T) {
 		{name: "NaN CPU limit", args: []string{"-config", "loadtest.yaml", "-docker-worker-cpus", "NaN"}, want: "docker-worker-cpus"},
 		{name: "sub-NanoCPU limit", args: []string{"-config", "loadtest.yaml", "-docker-worker-cpus", "0.5e-9"}, want: "docker-worker-cpus"},
 		{name: "overflowing CPU limit", args: []string{"-config", "loadtest.yaml", "-docker-worker-cpus", "10000000000"}, want: "docker-worker-cpus"},
+		{name: "empty Kubernetes namespace", args: []string{"-config", "loadtest.yaml", "-fleet-driver", "kubernetes", "-kubernetes-namespace", " "}, want: "kubernetes-namespace"},
+		{name: "empty Kubernetes Deployment", args: []string{"-config", "loadtest.yaml", "-fleet-driver", "kubernetes", "-kubernetes-worker-deployment", " "}, want: "kubernetes-worker-deployment"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -187,6 +196,24 @@ func TestParseOptionsRejectsInvalidManagedFleetFlags(t *testing.T) {
 				t.Fatalf("parseOptions() error = %v, want %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestParseOptionsAcceptsKubernetesFleet(t *testing.T) {
+	options, err := parseOptions([]string{
+		"-config", "loadtest.yaml",
+		"-fleet-driver", "kubernetes",
+		"-kubernetes-namespace", "performance",
+		"-kubernetes-worker-deployment", "workers",
+	})
+	if err != nil {
+		t.Fatalf("parseOptions() error = %v", err)
+	}
+	if options.fleetDriver != fleetDriverKubernetes {
+		t.Fatalf("fleet driver = %q, want %q", options.fleetDriver, fleetDriverKubernetes)
+	}
+	if options.kubernetesNamespace != "performance" || options.kubernetesWorkerDeployment != "workers" {
+		t.Fatalf("Kubernetes target = %s/%s, want performance/workers", options.kubernetesNamespace, options.kubernetesWorkerDeployment)
 	}
 }
 
@@ -226,11 +253,13 @@ func TestNewFleetManagerPropagatesDockerOptions(t *testing.T) {
 		workerOrchestratorAddress: want.OrchestratorAddress,
 		dockerAddHostGateway:      want.AddHostGateway,
 		dockerWorkerCPUs:          want.WorkerCPUs,
-	}, want.RunID, func(_ context.Context, got docker.Options) (fleet.FleetManager, error) {
-		if got != want {
-			t.Fatalf("Docker options = %+v, want %+v", got, want)
-		}
-		return manager, nil
+	}, want.RunID, fleetFactories{
+		docker: func(_ context.Context, got docker.Options) (fleet.FleetManager, error) {
+			if got != want {
+				t.Fatalf("Docker options = %+v, want %+v", got, want)
+			}
+			return manager, nil
+		},
 	})
 	if err != nil {
 		t.Fatalf("newFleetManager() error = %v", err)
@@ -242,11 +271,36 @@ func TestNewFleetManagerPropagatesDockerOptions(t *testing.T) {
 
 func TestNewFleetManagerReportsDockerCreationFailure(t *testing.T) {
 	wantErr := errors.New("Docker unavailable")
-	_, err := newFleetManager(context.Background(), cliOptions{fleetDriver: fleetDriverDocker}, "run-123", func(context.Context, docker.Options) (fleet.FleetManager, error) {
-		return nil, wantErr
+	_, err := newFleetManager(context.Background(), cliOptions{fleetDriver: fleetDriverDocker}, "run-123", fleetFactories{
+		docker: func(context.Context, docker.Options) (fleet.FleetManager, error) {
+			return nil, wantErr
+		},
 	})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("newFleetManager() error = %v, want %v", err, wantErr)
+	}
+}
+
+func TestNewFleetManagerPropagatesKubernetesOptions(t *testing.T) {
+	want := kubernetes.Options{Namespace: "performance", Deployment: "workers"}
+	manager := &fleetManagerStub{}
+	gotManager, err := newFleetManager(context.Background(), cliOptions{
+		fleetDriver:                fleetDriverKubernetes,
+		kubernetesNamespace:        want.Namespace,
+		kubernetesWorkerDeployment: want.Deployment,
+	}, "run-unused", fleetFactories{
+		kubernetes: func(_ context.Context, got kubernetes.Options) (fleet.FleetManager, error) {
+			if got != want {
+				t.Fatalf("Kubernetes options = %+v, want %+v", got, want)
+			}
+			return manager, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("newFleetManager() error = %v", err)
+	}
+	if gotManager != manager {
+		t.Fatalf("manager = %T, want returned Kubernetes manager", gotManager)
 	}
 }
 
@@ -326,7 +380,7 @@ func TestRunWithOptionsServesBeforePrepareAndCleansUpPrepareFailure(t *testing.T
 		runnableConstantRateConfig(),
 		"run-prepare-failure",
 		log.New(io.Discard, "", 0),
-		func(context.Context, docker.Options) (fleet.FleetManager, error) { return manager, nil },
+		fleetFactories{docker: func(context.Context, docker.Options) (fleet.FleetManager, error) { return manager, nil }},
 		func(_ fleet.FleetManager, gotControl *orchestrator.Server, _ loadconfig.Config, _ cliOptions, _ *log.Logger) (managedController, error) {
 			control = gotControl
 			return controller, nil

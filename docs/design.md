@@ -117,6 +117,7 @@ environment it is running in:
 ```go
 type FleetManager interface {
     Scale(ctx context.Context, desired int) error
+    Replace(ctx context.Context, workerID string) error
     List(ctx context.Context) ([]WorkerInfo, error)
     Teardown(ctx context.Context) error
 }
@@ -729,8 +730,9 @@ Averaging percentiles is mathematically invalid. Histograms merge exactly.
 **Rejected:** Docker-only, or Kubernetes-only.
 
 Compose provides a fast local development loop; Kubernetes provides the
-deployment experience the project exists to demonstrate. The interface means the
-orchestrator is byte-identical across both.
+deployment experience the project exists to demonstrate. The interface keeps the
+autoscaler and orchestration logic identical across both; only CLI driver
+selection and provider construction differ.
 
 Piece 16 introduces the provider-neutral `FleetManager` and `WorkerInfo` types,
 then implements `DockerDriver` with the official Docker Go SDK behind a narrow,
@@ -770,9 +772,55 @@ post-teardown `Scale` cannot create another container.
 
 These are not competing choices. EKS *is* Kubernetes with an AWS-managed control
 plane: same API, same manifests, same `kubectl`. The `K8sDriver` is written once
-and runs against both; moving to EKS means pointing `kubeconfig` at a different
-cluster. kind is the daily development loop; EKS is the Week-4 cloud validation
-run, torn down afterward.
+and runs in both. The orchestrator uses `client-go` in-cluster configuration and
+a namespace-scoped ServiceAccount in either environment. kind is the daily
+development loop; EKS is the Week-4 cloud validation run, torn down afterward.
+
+The Kubernetes manifests own a worker Deployment whose initial replica count is
+zero. `K8sDriver` never creates or deletes that Deployment; it validates its
+ownership labels, operates its `scale` subresource, lists its selected pods, and
+returns it to zero during teardown. The orchestrator runs as a one-shot Job with
+`backoffLimit: 0`, because restarting a failed process must not silently rerun a
+load test. A stable Service routes worker gRPC streams and Prometheus scrapes to
+the Job while it runs. Workers use their generated pod name as `WorkerID` and
+their immutable pod UID as `ProviderID`, so a replacement is represented as a
+real membership change rather than a synthetic stable slot.
+
+The production driver wraps the official typed client behind a narrow,
+fakeable interface for Deployment scale, pod listing, and pod deletion.
+`Scale(n)` updates only the scale subresource, retries optimistic-concurrency
+conflicts with bounded backoff, and waits for exactly `n` non-terminating pods in
+the `Running` phase. gRPC registration remains a separate orchestrator concern.
+`Replace(workerID)` deletes the matching pod with a UID precondition and waits
+for the Deployment to restore its desired running count; an already-absent pod
+means replacement is already underway. `Teardown` is idempotent, closes future
+scaling with `ErrClosed`, scales to zero, and leaves `List` available for cleanup
+verification. API timeouts, races, and incomplete cleanup become infrastructure
+violations rather than load-test threshold failures.
+
+Kustomize supplies a reusable base and a kind overlay for the orchestrator Job,
+worker and target Deployments, Services, ConfigMap mount, Prometheus, Grafana,
+and RBAC. Only the orchestrator mounts an API token. Its Role may get the worker
+Deployment, get and update `deployments/scale`, and get, list, and delete worker
+pods; it cannot read Secrets, create pods, delete Deployments, or operate in
+another namespace. The kind acceptance test checks those positive and negative
+permissions against the real API server. Actual scaling and listing exercise
+the in-cluster token, while a server-side dry-run pod deletion exercises delete
+authorization without moving Piece 22's fault injection into this piece.
+Kubernetes RBAC cannot restrict dynamic pod names by label, so pod list and
+delete permission is namespace-wide; the driver enforces the worker Deployment's
+selector before deletion. A separate worker namespace or admission policy is the
+future hard-security boundary if this moves beyond the current single-tenant
+test namespace.
+
+A disposable `scripts/test-kind.sh` cluster builds and loads local images,
+deploys the stack, and mounts the unchanged Piece 19 autoscaling scenario. It
+must observe worker replicas grow above one, scheduler coverage recover to at
+least 90 percent, Prometheus scrape autoscaler metrics, Grafana provision the
+existing dashboard, and teardown return the worker Deployment to zero. The
+script distinguishes infrastructure failure from a valid `PASS` or `FAIL` load
+test result and deletes the cluster unless `KEEP_KIND_CLUSTER=1` is set for
+debugging.
 
 ### Scaling mechanism — orchestrator-driven replica count
 

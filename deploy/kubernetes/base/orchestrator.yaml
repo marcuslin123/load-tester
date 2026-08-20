@@ -1,0 +1,92 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: load-tester-orchestrator
+spec:
+  selector:
+    app.kubernetes.io/name: load-tester-orchestrator
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: grpc
+    - name: metrics
+      port: 9091
+      targetPort: metrics
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: load-tester-orchestrator
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: load-tester-orchestrator
+    spec:
+      serviceAccountName: load-tester-orchestrator
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-target
+          image: busybox:1.37.0
+          command: ["/bin/sh", "-c"]
+          args:
+            - until wget -q -O /dev/null http://autoscale-target:8080/health; do sleep 1; done
+      containers:
+        - name: orchestrator
+          image: load-tester-orchestrator:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - -config
+            - /app/config/demo.yaml
+            - -metrics-addr
+            - :9091
+            - -fleet-driver
+            - kubernetes
+            - -kubernetes-namespace
+            - load-tester
+            - -kubernetes-worker-deployment
+            - load-tester-worker
+          ports:
+            - name: grpc
+              containerPort: 9090
+            - name: metrics
+              containerPort: 9091
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+          volumeMounts:
+            - name: load-test-config
+              mountPath: /app/config
+              readOnly: true
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: load-test-config
+          configMap:
+            name: load-test-config
+        - name: kube-api-access
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3600
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace

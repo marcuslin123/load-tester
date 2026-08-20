@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -22,6 +23,7 @@ import (
 	loadconfig "github.com/marcuslin123/load-tester/internal/config"
 	"github.com/marcuslin123/load-tester/internal/fleet"
 	"github.com/marcuslin123/load-tester/internal/fleet/docker"
+	"github.com/marcuslin123/load-tester/internal/fleet/kubernetes"
 	"github.com/marcuslin123/load-tester/internal/metrics"
 	"github.com/marcuslin123/load-tester/internal/orchestrator"
 	"github.com/marcuslin123/load-tester/internal/report"
@@ -50,23 +52,26 @@ const (
 )
 
 type cliOptions struct {
-	address                   string
-	metricsAddress            string
-	configPath                string
-	fleetDriver               fleetDriver
-	workerStartupTimeout      time.Duration
-	workerImage               string
-	dockerNetwork             string
-	workerOrchestratorAddress string
-	dockerAddHostGateway      bool
-	dockerWorkerCPUs          float64
+	address                    string
+	metricsAddress             string
+	configPath                 string
+	fleetDriver                fleetDriver
+	workerStartupTimeout       time.Duration
+	workerImage                string
+	dockerNetwork              string
+	workerOrchestratorAddress  string
+	dockerAddHostGateway       bool
+	dockerWorkerCPUs           float64
+	kubernetesNamespace        string
+	kubernetesWorkerDeployment string
 }
 
 type fleetDriver string
 
 const (
-	fleetDriverManual fleetDriver = "manual"
-	fleetDriverDocker fleetDriver = "docker"
+	fleetDriverManual     fleetDriver = "manual"
+	fleetDriverDocker     fleetDriver = "docker"
+	fleetDriverKubernetes fleetDriver = "kubernetes"
 )
 
 type runResult struct {
@@ -119,7 +124,7 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, logge
 		fmt.Fprintf(stderr, "orchestrator: generate run ID: %v\n", err)
 		return exitSetupFailure
 	}
-	summary, err := runWithOptions(ctx, options, cfg, runID, logger, newDockerFleetManager, newManagedController)
+	summary, err := runWithOptions(ctx, options, cfg, runID, logger, defaultFleetFactories(), newManagedController)
 	if err != nil {
 		fmt.Fprintf(stderr, "orchestrator: %v\n", err)
 		return exitSetupFailure
@@ -132,6 +137,12 @@ func execute(ctx context.Context, args []string, stdout, stderr io.Writer, logge
 }
 
 type dockerFleetFactory func(context.Context, docker.Options) (fleet.FleetManager, error)
+type kubernetesFleetFactory func(context.Context, kubernetes.Options) (fleet.FleetManager, error)
+
+type fleetFactories struct {
+	docker     dockerFleetFactory
+	kubernetes kubernetesFleetFactory
+}
 
 func validateFleetSelection(options cliOptions, cfg loadconfig.Config) error {
 	if options.fleetDriver == fleetDriverManual && cfg.Fleet.Autoscale {
@@ -144,13 +155,13 @@ func newFleetManager(
 	ctx context.Context,
 	options cliOptions,
 	runID string,
-	newDockerFleet dockerFleetFactory,
+	factories fleetFactories,
 ) (fleet.FleetManager, error) {
 	switch options.fleetDriver {
 	case fleetDriverManual:
 		return nil, nil
 	case fleetDriverDocker:
-		manager, err := newDockerFleet(ctx, docker.Options{
+		manager, err := factories.docker(ctx, docker.Options{
 			RunID:               runID,
 			Image:               options.workerImage,
 			Network:             options.dockerNetwork,
@@ -160,6 +171,15 @@ func newFleetManager(
 		})
 		if err != nil {
 			return nil, fmt.Errorf("create Docker fleet driver: %w", err)
+		}
+		return manager, nil
+	case fleetDriverKubernetes:
+		manager, err := factories.kubernetes(ctx, kubernetes.Options{
+			Namespace:  options.kubernetesNamespace,
+			Deployment: options.kubernetesWorkerDeployment,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create Kubernetes fleet driver: %w", err)
 		}
 		return manager, nil
 	default:
@@ -199,13 +219,15 @@ func parseOptions(args []string) (cliOptions, error) {
 	address := flags.String("addr", ":9090", "gRPC listen address")
 	metricsAddress := flags.String("metrics-addr", ":9091", "metrics and health listen address")
 	configPath := flags.String("config", "", "path to the load-test YAML file")
-	fleetDriverName := flags.String("fleet-driver", string(fleetDriverManual), "worker fleet driver (manual or docker)")
+	fleetDriverName := flags.String("fleet-driver", string(fleetDriverManual), "worker fleet driver (manual, docker, or kubernetes)")
 	startupTimeout := flags.Duration("worker-startup-timeout", workerStartupTimeout, "maximum time for managed workers to register")
 	workerImage := flags.String("worker-image", "load-tester-worker:latest", "managed worker container image")
 	dockerNetwork := flags.String("docker-network", "bridge", "Docker network for managed workers")
 	workerOrchestratorAddress := flags.String("worker-orchestrator-addr", "host.docker.internal:9090", "orchestrator address used by managed workers")
 	dockerAddHostGateway := flags.Bool("docker-add-host-gateway", false, "add host.docker.internal host-gateway mapping to managed workers")
 	dockerWorkerCPUs := flags.Float64("docker-worker-cpus", 0, "per-worker Docker CPU limit; zero is unlimited")
+	kubernetesNamespace := flags.String("kubernetes-namespace", "load-tester", "namespace containing the managed worker Deployment")
+	kubernetesWorkerDeployment := flags.String("kubernetes-worker-deployment", "load-tester-worker", "managed worker Deployment name")
 	if err := flags.Parse(args); err != nil {
 		return cliOptions{}, err
 	}
@@ -216,7 +238,7 @@ func parseOptions(args []string) (cliOptions, error) {
 		return cliOptions{}, errors.New("-config is required")
 	}
 	driver := fleetDriver(*fleetDriverName)
-	if driver != fleetDriverManual && driver != fleetDriverDocker {
+	if driver != fleetDriverManual && driver != fleetDriverDocker && driver != fleetDriverKubernetes {
 		return cliOptions{}, fmt.Errorf("unknown fleet driver %q", *fleetDriverName)
 	}
 	if *startupTimeout <= 0 {
@@ -225,17 +247,27 @@ func parseOptions(args []string) (cliOptions, error) {
 	if err := docker.ValidateWorkerCPUs(*dockerWorkerCPUs); err != nil {
 		return cliOptions{}, fmt.Errorf("-docker-worker-cpus: %w", err)
 	}
+	namespace := strings.TrimSpace(*kubernetesNamespace)
+	deployment := strings.TrimSpace(*kubernetesWorkerDeployment)
+	if driver == fleetDriverKubernetes && namespace == "" {
+		return cliOptions{}, errors.New("-kubernetes-namespace is required for the Kubernetes fleet driver")
+	}
+	if driver == fleetDriverKubernetes && deployment == "" {
+		return cliOptions{}, errors.New("-kubernetes-worker-deployment is required for the Kubernetes fleet driver")
+	}
 	return cliOptions{
-		address:                   *address,
-		metricsAddress:            *metricsAddress,
-		configPath:                *configPath,
-		fleetDriver:               driver,
-		workerStartupTimeout:      *startupTimeout,
-		workerImage:               *workerImage,
-		dockerNetwork:             *dockerNetwork,
-		workerOrchestratorAddress: *workerOrchestratorAddress,
-		dockerAddHostGateway:      *dockerAddHostGateway,
-		dockerWorkerCPUs:          *dockerWorkerCPUs,
+		address:                    *address,
+		metricsAddress:             *metricsAddress,
+		configPath:                 *configPath,
+		fleetDriver:                driver,
+		workerStartupTimeout:       *startupTimeout,
+		workerImage:                *workerImage,
+		dockerNetwork:              *dockerNetwork,
+		workerOrchestratorAddress:  *workerOrchestratorAddress,
+		dockerAddHostGateway:       *dockerAddHostGateway,
+		dockerWorkerCPUs:           *dockerWorkerCPUs,
+		kubernetesNamespace:        namespace,
+		kubernetesWorkerDeployment: deployment,
 	}, nil
 }
 
@@ -288,7 +320,7 @@ func run(
 		metricsAddress:       metricsAddress,
 		fleetDriver:          fleetDriverManual,
 		workerStartupTimeout: workerStartupTimeout,
-	}, cfg, runID, logger, newDockerFleetManager, newManagedController)
+	}, cfg, runID, logger, defaultFleetFactories(), newManagedController)
 }
 
 func runWithOptions(
@@ -297,7 +329,7 @@ func runWithOptions(
 	cfg loadconfig.Config,
 	runID string,
 	logger *log.Logger,
-	newDockerFleet dockerFleetFactory,
+	factories fleetFactories,
 	newController managedControllerFactory,
 ) (report.Summary, error) {
 	grpcListener, err := net.Listen("tcp", options.address)
@@ -355,7 +387,7 @@ func runWithOptions(
 		return report.Summary{}, finishManagedSetupFailure(err, cancel, grpcServer, httpServer, nil)
 	}
 
-	manager, err := newFleetManager(runCtx, options, runID, newDockerFleet)
+	manager, err := newFleetManager(runCtx, options, runID, factories)
 	if err != nil {
 		return report.Summary{}, finishManagedSetupFailure(err, cancel, grpcServer, httpServer, nil)
 	}
@@ -386,6 +418,14 @@ func runWithOptions(
 
 func newDockerFleetManager(ctx context.Context, options docker.Options) (fleet.FleetManager, error) {
 	return docker.New(ctx, options)
+}
+
+func newKubernetesFleetManager(ctx context.Context, options kubernetes.Options) (fleet.FleetManager, error) {
+	return kubernetes.New(ctx, options)
+}
+
+func defaultFleetFactories() fleetFactories {
+	return fleetFactories{docker: newDockerFleetManager, kubernetes: newKubernetesFleetManager}
 }
 
 func newManagedController(

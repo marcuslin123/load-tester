@@ -641,6 +641,31 @@ project (spec §6) — the fleet scaling itself, and the target scaling under lo
 and being able to tell them apart cleanly is worth more in an interview than
 either alone.
 
+Use an `autoscaling/v2` HPA with one to five target replicas, a 60 percent CPU
+target, and `250m` CPU requests and limits. Scale up immediately but scale down
+conservatively, returning the target to one replica after traffic stops. Metrics
+Server supplies the HPA resource metrics API; a pinned, namespace-restricted
+kube-state-metrics deployment exposes replica, utilization, and condition state
+to Prometheus. Provision a separate Kubernetes-only `Target Autoscaling`
+dashboard and leave the Compose-compatible overview unchanged.
+
+Run a dedicated two-minute constant-rate scenario against `/burn?ms=20` with two
+fixed managed workers. The final platform can run both autoscalers at once, but
+fixed workers isolate the target HPA for this proof. Set `Connection: close`
+because a Kubernetes Service balances new TCP connections and existing
+keep-alive connections can remain pinned to the original pod after scale-up.
+The normal HTTP transport continues to reuse connections in every other
+scenario.
+
+`scripts/test-kind-hpa.sh` is separate from the Piece 20 smoke test. It verifies
+the Metrics API and HPA are healthy, the target reaches at least three replicas
+without remaining capacity-limited at five, throughput stays within 90 percent
+of demand, final full-load p95 improves by at least 20 percent from the saturated
+peak, the load result passes with no integrity violations, the target returns to
+one replica, workers return to zero, and the disposable cluster is deleted.
+Tune the committed request rate or burn duration only from measured kind
+evidence, not estimates.
+
 ### Piece 22 — Fault injection under Kubernetes
 
 **Goal:** Confirm Piece 14's recovery still holds when the fleet is real pods

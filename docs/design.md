@@ -822,6 +822,64 @@ script distinguishes infrastructure failure from a valid `PASS` or `FAIL` load
 test result and deletes the cluster unless `KEEP_KIND_CLUSTER=1` is set for
 debugging.
 
+### Target autoscaling under generated load
+
+Piece 21 adds a second, independent control loop: an `autoscaling/v2`
+Horizontal Pod Autoscaler scales only the target Deployment from one to five
+replicas using average CPU utilization. Each target pod requests and is limited
+to `250m` CPU, and the HPA targets 60 percent of that request. Scale-up has no
+stabilization delay and may add up to 100 percent or two pods per 15 seconds.
+The larger permitted increase wins so a small fleet can react quickly.
+Scale-down is deliberately conservative: the reusable policy stabilizes for
+five minutes and removes at most one pod per minute, while the kind experiment
+uses a 60-second stabilization window to keep local validation practical. The
+target returns to one replica after traffic ends; only the disposable cluster
+cleanup removes it entirely.
+
+The experiment fixes the managed worker fleet at two workers so target behavior
+has one controlled input. The completed platform can run worker and target
+autoscaling simultaneously, but doing that in this correctness test would make
+it harder to determine which control loop caused a capacity change. A dedicated
+two-minute constant-rate scenario sends approximately 30 requests per second to
+`/burn?ms=20`, with final values calibrated against the live kind test. The load
+test must preserve at least 90 percent of configured throughput, reach at least
+three target replicas without remaining pinned at the five-replica ceiling,
+reduce steady-state p95 latency by at least 20 percent from its saturated peak,
+and finish with no unmet demand or dropped samples.
+
+Kubernetes Services normally choose a backend for each TCP connection rather
+than each HTTP request. The load tester correctly reuses keep-alive connections
+by default, but connections established before scale-up can remain pinned to the
+original target pod and leave new replicas idle. The Piece 21 scenario therefore
+sets `Connection: close` so each request can be distributed across the current
+Service endpoints. Connection setup remains part of measured latency in both the
+peak and recovery windows. Production systems commonly address the same issue
+with naturally rotating connections, an L7 proxy, or a service mesh; the normal
+load-tester transport remains unchanged.
+
+Metrics Server supplies the resource metrics API used by the HPA. A separate,
+read-only kube-state-metrics deployment exposes HPA object state to Prometheus,
+including current and desired replicas, current and target utilization, and HPA
+conditions. The two components are intentionally not conflated: Metrics Server
+drives the control loop, while kube-state-metrics provides historical dashboard
+visibility. Their upstream manifests are pinned in the repository so the test
+does not download mutable dependencies at runtime. The reusable Metrics Server
+configuration preserves kubelet TLS verification; only the kind overlay may add
+the local `--kubelet-insecure-tls` exception. kube-state-metrics is restricted to
+read-only access in the `load-tester` namespace and to the object state required
+by this experiment.
+
+The existing Compose-compatible `Load Tester Overview` dashboard remains
+unchanged. Kubernetes additionally provisions a `Target Autoscaling` dashboard
+that correlates current and desired replicas, min/max bounds, current versus
+target CPU utilization, HPA conditions, request rate, latency percentiles, and
+error rate. `scripts/test-kind-hpa.sh` owns a separate disposable-cluster test so
+the longer HPA validation does not slow the Piece 20 fleet-driver smoke test. It
+requires the Metrics API, HPA, Prometheus scrape, dashboard provisioning,
+scale-up, full-load latency recovery, load-test `PASS`, target scale-down to one,
+worker teardown to zero, and cluster deletion. `KEEP_KIND_CLUSTER=1` preserves
+failures with HPA, event, pod, add-on, orchestrator, and Prometheus diagnostics.
+
 ### Scaling mechanism — orchestrator-driven replica count
 
 **Rejected:** relying on the Kubernetes HPA to scale the worker fleet.

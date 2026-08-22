@@ -13,7 +13,7 @@ import (
 type manifest map[string]any
 
 func TestKindOverlayRendersFleetStack(t *testing.T) {
-	manifests := renderKindOverlay(t)
+	manifests := renderOverlay(t, "overlays/kind")
 
 	assertString(t, resource(t, manifests, "Namespace", "load-tester"), "metadata", "name", "load-tester")
 
@@ -50,6 +50,8 @@ func TestKindOverlayRendersFleetStack(t *testing.T) {
 	target := resource(t, manifests, "Deployment", "autoscale-target")
 	assertBool(t, target, false, "spec", "template", "spec", "automountServiceAccountToken")
 	assertContainerImage(t, target, "target", "load-tester-target:kind")
+	assertString(t, target, "spec", "template", "spec", "containers", 0, "resources", "requests", "cpu", "250m")
+	assertString(t, target, "spec", "template", "spec", "containers", 0, "resources", "limits", "cpu", "250m")
 	assertServicePort(t, resource(t, manifests, "Service", "autoscale-target"), "http", 8080)
 
 	orchestratorService := resource(t, manifests, "Service", "load-tester-orchestrator")
@@ -97,12 +99,12 @@ func assertDashboardMatchesCompose(t *testing.T, dashboardConfig manifest) {
 	}
 }
 
-func renderKindOverlay(t *testing.T) []manifest {
+func renderOverlay(t *testing.T, path string) []manifest {
 	t.Helper()
-	command := exec.Command("kubectl", "kustomize", "overlays/kind")
+	command := exec.Command("kubectl", "kustomize", path)
 	output, err := command.CombinedOutput()
 	if err != nil {
-		t.Fatalf("render kind overlay: %v\n%s", err, output)
+		t.Fatalf("render overlay %s: %v\n%s", path, err, output)
 	}
 
 	decoder := yaml.NewDecoder(bytes.NewReader(output))

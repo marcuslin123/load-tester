@@ -29,6 +29,11 @@ spec:
         - name: target
           image: load-tester-target:latest
           imagePullPolicy: IfNotPresent
+          resources:
+            requests:
+              cpu: 250m
+            limits:
+              cpu: 250m
           ports:
             - name: http
               containerPort: 8080

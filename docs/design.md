@@ -880,6 +880,48 @@ scale-up, full-load latency recovery, load-test `PASS`, target scale-down to one
 worker teardown to zero, and cluster deletion. `KEEP_KIND_CLUSTER=1` preserves
 failures with HPA, event, pod, add-on, orchestrator, and Prometheus diagnostics.
 
+### Worker fault injection under Kubernetes
+
+Piece 22 validates the Piece 14 recovery contract against real pod lifecycle
+behavior. A dedicated kind experiment keeps the target at one replica and the
+worker Deployment at exactly three replicas with worker autoscaling disabled.
+This isolates recovery from both target HPA behavior and fleet capacity
+decisions. A two-minute constant-rate run ramps for ten seconds and reaches a
+steady state before the test selects a worker that has contributed requests and
+deletes its pod with a normal `kubectl delete pod`. Kubernetes therefore sends
+`SIGTERM` and observes the normal termination grace period; forced deletion,
+node failure, and simultaneous worker losses remain later fault scenarios.
+
+Because the local kind experiment has one node, replacement can finish between
+one-second Prometheus scrapes and hide the worker-count dip. The harness briefly
+cordons that node before deletion, waits for Prometheus to observe fewer than
+three active workers, and immediately uncordons it. Existing pods continue
+running while cordoned; this only bounds replacement scheduling for deterministic
+observability and does not change the normal deletion or recovery contract.
+
+The orchestrator and Kubernetes own different parts of recovery. Closing the
+deleted worker's gRPC stream makes the orchestrator retain its accepted complete
+deltas, record an active-worker integrity violation, and redistribute its load
+across the two surviving workers. The Deployment's ReplicaSet independently
+creates a replacement because desired replicas remain three. The replacement
+has a new pod UID and worker ID, registers with the orchestrator, and triggers a
+second rebalance across all three workers. An unfinished interval that never
+left the deleted process is not reconstructed; any absolute-schedule arrivals
+missed before replacement-assignment activation are recorded as unmet demand.
+
+Recovery correctness and load-result correctness are deliberately reported
+separately. The acceptance script passes only when it observes the active-worker
+dip and return to three, a new Ready pod contributing requests, at least 90
+percent of configured throughput over a ten-second post-recovery window, and
+the deleted worker's accepted request counter remaining at or above its
+pre-deletion value. The load test itself must finish with `Result: FAIL` and one
+integrity violation naming the deleted worker: recovery cannot turn lost metric
+coverage into a trustworthy pass. Scaling workers to zero after the run is
+intentional teardown and must not add another worker-failure violation. The
+existing `Load Tester Overview` dashboard shows worker count, fleet and
+per-worker throughput, unmet demand, and recovery without introducing a
+fault-specific dashboard.
+
 ### Scaling mechanism — orchestrator-driven replica count
 
 **Rejected:** relying on the Kubernetes HPA to scale the worker fleet.

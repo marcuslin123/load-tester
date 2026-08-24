@@ -1,0 +1,22 @@
+name: kubernetes-worker-fault-injection
+
+target:
+  protocol: http
+  method: GET
+  url: http://autoscale-target:8080/delay?ms=20
+
+load:
+  model: constant-rate
+  rate: 90
+  max_in_flight: 300
+  duration: 2m
+  ramp_up: 10s
+
+fleet:
+  min_workers: 3
+  max_workers: 3
+  autoscale: false
+
+thresholds:
+  p99_latency: 0
+  error_rate: 1

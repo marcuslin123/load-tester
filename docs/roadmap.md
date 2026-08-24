@@ -674,9 +674,20 @@ being deleted.
 **Why here:** Recovery was proven against local processes. Pod deletion is a
 different failure shape — the replica controller is also reacting.
 
-**Done when:** `kubectl delete pod` on a worker mid-run completes the run with
-load redistributed, and the dashboard shows the dip and recovery. No metrics from
-before the failure are lost.
+**Done when:** A dedicated two-minute kind test fixes the target at one replica
+and the worker fleet at three, waits until every worker contributes steady
+constant-rate traffic, and normally deletes one active pod. The test must observe
+the connected fleet dip below three, a different Ready replacement pod register
+and contribute requests, the fleet return to three, and a ten-second recovery
+window sustain at least 90 percent of configured throughput. The deleted
+worker's accepted request counter must not decrease. The load result must fail
+with exactly one integrity violation naming that worker, while the fault test
+passes and intentional post-run teardown reaches zero workers without another
+failure. The existing dashboard shows the dip, worker composition change, and
+recovery, and the disposable cluster is deleted unless retained for diagnostics.
+On single-node kind, briefly cordon the node around deletion so a Prometheus
+scrape deterministically captures the dip, then uncordon it before waiting for
+the replacement; this delays only replacement scheduling, not existing pods.
 
 **Teaches:** Kubernetes pod lifecycle, graceful shutdown and `SIGTERM`,
 distinguishing failure from intentional scale-down.

@@ -507,8 +507,9 @@ worker is reproducibly under-provisioned. It verifies scale-up,
 scheduler-coverage recovery, and complete teardown without depending on the host
 being naturally saturated.
 
-**Fault injection.** `docker kill` a worker mid-test; assert the run completes and
-the fleet self-heals.
+**Fault injection.** Docker integration covers lifecycle, scaling, registration,
+and teardown. Kubernetes fault tests delete a worker pod mid-test and assert
+recovery.
 
 ---
 

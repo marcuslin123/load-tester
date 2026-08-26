@@ -725,6 +725,13 @@ This is the gate that closes Layer 1.
 `docker compose up`, and get a working test with dashboards, following only the
 README. The measured numbers are present with no placeholders left.
 
+Deliver Piece 24 in two passes. Piece 24A creates the concise README, local
+dashboard screenshot, architecture diagram, and verified Compose quickstart
+without estimated cloud results. Piece 24B follows Piece 23, replaces the pending
+benchmark note with measured EKS topology and results, and closes the Phase 4
+gate. Piece 24 remains incomplete until Piece 24B contains no placeholders or
+pending benchmark language.
+
 **Teaches:** Technical writing, diagramming, documenting a known ceiling
 honestly.
 

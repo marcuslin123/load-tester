@@ -1,2 +1,4 @@
 .cache/
 bin/
+artifacts/eks/
+scripts/__pycache__/

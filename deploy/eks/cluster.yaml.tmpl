@@ -1,0 +1,43 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: __CLUSTER_NAME__
+  region: us-west-2
+  version: "1.34"
+  tags:
+    load-tester.io/run-id: "__RUN_ID__"
+    load-tester.io/workflow-identity: "__WORKFLOW_IDENTITY__"
+
+availabilityZones:
+  - __AZ_A__
+  - __AZ_B__
+
+vpc:
+  nat:
+    gateway: Single
+  clusterEndpoints:
+    publicAccess: true
+    privateAccess: true
+  publicAccessCIDRs:
+    - __PUBLIC_API_CIDR__
+
+managedNodeGroups:
+  - name: loadgen
+    instanceType: c7i.large
+    capacityType: ON_DEMAND
+    privateNetworking: true
+    minSize: 2
+    desiredCapacity: 2
+    maxSize: 2
+    labels:
+      load-tester.io/pool: loadgen
+  - name: platform
+    instanceType: m7i.large
+    capacityType: ON_DEMAND
+    privateNetworking: true
+    minSize: 2
+    desiredCapacity: 2
+    maxSize: 2
+    labels:
+      load-tester.io/pool: platform

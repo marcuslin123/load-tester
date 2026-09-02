@@ -713,6 +713,17 @@ of it. And every number that reaches the resume comes from this run — placehol
 in the resume draft exist to be replaced with these figures, not to be quietly
 guessed.
 
+**Stage 1 — locally implemented, not an AWS run.** The repository now contains
+the guarded `eksctl` topology, EKS overlays, ECR image workflow, redaction,
+ownership-tagged teardown, and offline fake-command tests. It creates no AWS
+resources and records no benchmark result.
+
+**Stage 2 — pending measured EKS run.** After manual account, SSO, budget, and
+billing setup, run the calibration-first benchmark, capture the approved
+dashboard, verify teardown, and complete the next-day billing check. Piece 23
+remains incomplete until the measured EKS run and next-day billing attestation
+exist. Piece 24B remains pending until it can cite that sanitized evidence.
+
 ### Piece 24 — README **(Phase 4 gate, Layer 1 done)**
 
 **Goal:** A short README: what it is, architecture diagram, quickstart, measured

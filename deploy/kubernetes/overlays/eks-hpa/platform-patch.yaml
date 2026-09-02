@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metrics-server
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      nodeSelector:
+        load-tester.io/pool: platform
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: load-tester
+spec:
+  template:
+    spec:
+      nodeSelector:
+        load-tester.io/pool: platform

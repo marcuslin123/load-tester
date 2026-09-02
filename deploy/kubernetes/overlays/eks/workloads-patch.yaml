@@ -1,0 +1,94 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-tester-worker
+spec:
+  template:
+    spec:
+      nodeSelector:
+        load-tester.io/pool: loadgen
+      containers:
+        - name: worker
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: load-tester-orchestrator
+spec:
+  template:
+    spec:
+      nodeSelector:
+        load-tester.io/pool: platform
+      containers:
+        - name: orchestrator
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autoscale-target
+spec:
+  template:
+    spec:
+      nodeSelector:
+        load-tester.io/pool: platform
+      containers:
+        - name: target
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+spec:
+  template:
+    spec:
+      nodeSelector:
+        load-tester.io/pool: platform
+      containers:
+        - name: prometheus
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+spec:
+  template:
+    spec:
+      nodeSelector:
+        load-tester.io/pool: platform
+      containers:
+        - name: grafana
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi

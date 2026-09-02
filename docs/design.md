@@ -931,6 +931,31 @@ An HPA cannot know the *test's* target load; it only observes CPU after the fact
 The orchestrator scales on the load deficit, which is the actual signal. The HPA
 is still demonstrated — on the target app, per §6.
 
+### EKS benchmark — guarded cloud validation
+
+Piece 23 is calibration-first: it publishes only measurements from a clean EKS
+run, never a chosen concurrency headline. Two fixed `c7i.large` load-generation
+nodes and two fixed `m7i.large` platform nodes use private subnets across two AZs
+with one NAT gateway. Workers select the load-generation pool; the target,
+orchestrator, and monitoring select the platform pool. This separates generator
+pressure from target capacity while keeping a short benchmark cost-conscious. No
+node autoscaling or scale-down policy is added: worker pods may scale 1–4 for a
+constant-rate run, and target pods may scale through their HPA.
+
+The Worker-fleet experiment uses `/echo` with target HPA disabled. The Target-HPA
+experiment fixes two workers and uses `/burn?ms=20`; keeping those control loops
+separate makes each scale-up attributable. A 90-minute deadline begins before
+cluster creation. IAM Identity Center SSO, a `$10` budget alert, and anomaly
+alerts provide account safeguards, but the alerts are not hard caps.
+
+The workflow has no keep-cluster mode. It records diagnostics, then deletes the
+owned cluster and uses fail closed cleanup when deletion or inventory cannot be
+verified. A local run sentinel plus matching cloud ownership tags prevent an
+emergency teardown from targeting another cluster. The raw artifacts remain local
+and gitignored; only sanitized evidence can enter `docs/benchmarks/eks/` after a
+human-approved SHA-256 dashboard sidecar and next-day billing attestation. Stage
+1 is offline automation only; no AWS benchmark results exist yet.
+
 ### HTTP client — `net/http` with a tuned `Transport`
 
 **Rejected:** `fasthttp`.

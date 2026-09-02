@@ -1,0 +1,22 @@
+name: eks-worker-autoscale
+
+target:
+  protocol: http
+  method: GET
+  url: http://autoscale-target:8080/echo
+
+load:
+  model: constant-rate
+  rate: __RATE__
+  max_in_flight: 1000
+  duration: 3m
+  ramp_up: 30s
+
+fleet:
+  min_workers: 1
+  max_workers: 4
+  autoscale: true
+
+thresholds:
+  p99_latency: 0
+  error_rate: 1

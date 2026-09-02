@@ -67,7 +67,7 @@ func TestEKSClusterConfigRejectsUnsafeTopology(t *testing.T) {
 			cfg["managedNodeGroups"].([]any)[1].(map[string]any)["instanceType"] = "c7i.large"
 		},
 		"spot capacity": func(cfg map[string]any) {
-			cfg["managedNodeGroups"].([]any)[0].(map[string]any)["capacityType"] = "SPOT"
+			cfg["managedNodeGroups"].([]any)[0].(map[string]any)["spot"] = true
 		},
 		"elastic nodes": func(cfg map[string]any) {
 			cfg["managedNodeGroups"].([]any)[0].(map[string]any)["maxSize"] = 3
@@ -133,7 +133,7 @@ func validateClusterConfig(cfg map[string]any) error {
 		}
 		name, _ := group["name"].(string)
 		instance, _ := group["instanceType"].(string)
-		if group["capacityType"] != "ON_DEMAND" || group["privateNetworking"] != true || group["minSize"] != 2 || group["desiredCapacity"] != 2 || group["maxSize"] != 2 {
+		if _, hasCapacityType := group["capacityType"]; hasCapacityType || group["spot"] == true || group["privateNetworking"] != true || group["minSize"] != 2 || group["desiredCapacity"] != 2 || group["maxSize"] != 2 {
 			return fmt.Errorf("node group %q is not fixed private On-Demand capacity", name)
 		}
 		seen[name] = instance
@@ -164,7 +164,8 @@ func assertNodeGroup(t *testing.T, groups []any, name, instance, label, labelVal
 		if group["name"] != name {
 			continue
 		}
-		if group["instanceType"] != instance || group["capacityType"] != "ON_DEMAND" || group["privateNetworking"] != true || group["minSize"] != 2 || group["desiredCapacity"] != 2 || group["maxSize"] != 2 || group["ssh"] != nil {
+		_, hasCapacityType := group["capacityType"]
+		if group["instanceType"] != instance || hasCapacityType || group["spot"] == true || group["privateNetworking"] != true || group["minSize"] != 2 || group["desiredCapacity"] != 2 || group["maxSize"] != 2 || group["ssh"] != nil {
 			t.Fatalf("node group %q = %#v, want fixed private %s On-Demand group without SSH", name, group, instance)
 		}
 		labels, _ := group["labels"].(map[string]any)

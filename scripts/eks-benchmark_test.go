@@ -263,6 +263,16 @@ func TestEKSBenchmarkECRPushRequiresApprovalAndPublishesThreeImmutableImages(t *
 	}
 }
 
+func TestEKSBenchmarkECRPushPassesPasswordToDockerLogin(t *testing.T) {
+	parallelEKSBenchmarkTest(t)
+	result := runEKSBenchmark(t, "ecr-push", baseEKSEnvironment(), map[string]string{
+		"EKS_FAKE_DOCKER_LOGIN_REQUIRES_PASSWORD": "1",
+	})
+	if result.Status != 0 {
+		t.Fatalf("ecr-push did not pass the ECR password to docker login: %s", result.Output)
+	}
+}
+
 func TestEKSBenchmarkECRPushRejectsDirtySourceBeforeMutation(t *testing.T) {
 	parallelEKSBenchmarkTest(t)
 	result := runEKSBenchmark(t, "ecr-push", baseEKSEnvironment(), map[string]string{"GIT_DIRTY": "1"})
@@ -1679,6 +1689,10 @@ kustomize)
   exit 0
   ;;
 docker)
+	if [[ "$*" == "login --username AWS --password-stdin"* && "${EKS_FAKE_DOCKER_LOGIN_REQUIRES_PASSWORD:-0}" == 1 ]]; then
+	  IFS= read -r password || { printf 'fake docker login requires a password on stdin\n' >&2; exit 1; }
+	  [[ "$password" == fake-password ]] || { printf 'fake docker login received an unexpected password\n' >&2; exit 1; }
+	fi
   if [[ "$*" == "buildx build"* && "${EKS_FAKE_DOCKER_BUILDX_BLOCK:-0}" == 1 ]]; then
     printf '%s\n' "$$" >"$EKS_FAKE_STATE_DIR/docker-buildx-pid"
     trap 'printf "terminated\\n" >"$EKS_FAKE_STATE_DIR/docker-buildx-terminated"; exit 143' TERM

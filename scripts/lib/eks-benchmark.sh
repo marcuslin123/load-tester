@@ -655,6 +655,10 @@ run_bounded_command_with_grace() {
   rm -f "$status_file" "$ready_file"
   mkfifo "$wait_fifo"
   exec 9<>"$wait_fifo"
+	# Background jobs otherwise receive /dev/null as standard input in
+	# non-interactive Bash. Preserve the caller's input for commands such as
+	# docker login --password-stdin.
+	exec 8<&0
   python3 -c '
 import os
 import signal
@@ -670,7 +674,7 @@ command = sys.argv[5:]
 ready_path = sys.argv[5]
 command = sys.argv[6:]
 os.setsid()
-child = subprocess.Popen(command, start_new_session=True)
+child = subprocess.Popen(command, start_new_session=True, stdin=8)
 
 def report(status):
     temporary = status_path + ".tmp"
@@ -758,6 +762,7 @@ raise SystemExit(status)
   status=$(<"$status_file")
   wait "$child_pid" 2>/dev/null || true
   exec 9>&-
+	exec 8<&-
   [[ "$status" =~ ^[0-9]+$ ]] || status=1
   rm -f "$status_file" "$ready_file" "$ready_file.tmp" "$wait_fifo"
   if [[ "$scope" == session || "$scope" == external ]]; then

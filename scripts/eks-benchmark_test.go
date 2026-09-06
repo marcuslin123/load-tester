@@ -373,6 +373,16 @@ func TestEKSBenchmarkRunWritesOwnedStateAndAlwaysTeardownAfterSuccess(t *testing
 	assertCallBefore(t, result.Calls, "eksctl delete cluster", "aws ec2 describe-instances")
 }
 
+func TestEKSBenchmarkRunLetsRenderedConfigSetClusterRegion(t *testing.T) {
+	parallelEKSBenchmarkTest(t)
+	result := runEKSBenchmark(t, "run", baseEKSEnvironment(), nil)
+	if result.Status != 0 {
+		t.Fatalf("run failed: %s", result.Output)
+	}
+	assertCallContains(t, result.Calls, "eksctl create cluster --config-file")
+	assertNoCallContaining(t, result.Calls, "eksctl create cluster --config-file", "--region")
+}
+
 func TestEKSBenchmarkRunInstallsStacksBeforeReadinessAndUsesConfigMapsForScenarios(t *testing.T) {
 	parallelEKSBenchmarkTest(t)
 	result := runEKSBenchmark(t, "run", baseEKSEnvironment(), nil)

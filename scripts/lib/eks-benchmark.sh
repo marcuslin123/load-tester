@@ -823,7 +823,7 @@ run_managed_sleep() {
 
 create_owned_cluster() {
   CLUSTER_CREATE_ATTEMPTED=1
-  run_managed_command eksctl create cluster --config-file "$CLUSTER_CONFIG" --region "$AWS_REGION"
+  run_managed_command eksctl create cluster --config-file "$CLUSTER_CONFIG"
 }
 
 wait_for_platform_readiness() {

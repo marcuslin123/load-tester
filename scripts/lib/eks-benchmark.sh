@@ -789,12 +789,18 @@ run_ecr_push_exit_cleanup() {
   exit "$status"
 }
 
-run_managed_command() {
-  local remaining timeout=${EKS_COMMAND_TIMEOUT_SECONDS:-600}
+run_managed_command_with_timeout() {
+  local timeout=$1 remaining
+  shift
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || die "command timeout must be a positive integer"
   deadline_remaining || die "benchmark deadline elapsed before running: $*"
   remaining=$((STATE_DEADLINE_EPOCH - $(date -u +%s)))
   (( timeout <= remaining )) || timeout=$remaining
   run_bounded_command "$timeout" session "$@"
+}
+
+run_managed_command() {
+  run_managed_command_with_timeout "${EKS_COMMAND_TIMEOUT_SECONDS:-600}" "$@"
 }
 
 # Cleanup commands may run after the benchmark deadline, but each is bounded.
@@ -823,7 +829,7 @@ run_managed_sleep() {
 
 create_owned_cluster() {
   CLUSTER_CREATE_ATTEMPTED=1
-  run_managed_command eksctl create cluster --config-file "$CLUSTER_CONFIG"
+  run_managed_command_with_timeout "${EKS_CLUSTER_CREATE_TIMEOUT_SECONDS:-1800}" eksctl create cluster --config-file "$CLUSTER_CONFIG"
 }
 
 wait_for_platform_readiness() {
@@ -1393,12 +1399,13 @@ delete_owned_cluster() {
 }
 
 inventory_remaining_resources() {
-  local count failed=0 inventory='' output
+  local cluster_absent=0 count failed=0 inventory='' output
   if output=$(run_cleanup_probe_command aws eks describe-cluster --name "$STATE_CLUSTER" --region "$STATE_REGION" 2>&1); then
     inventory+='eks=1'$'\n'
     failed=1
   elif [[ "$output" == *ResourceNotFoundException* ]]; then
     inventory+='eks=0'$'\n'
+    cluster_absent=1
   else
     inventory+='eks=ERROR'$'\n'
     failed=1
@@ -1414,14 +1421,17 @@ inventory_remaining_resources() {
       failed=1
     fi
   }
-  inventory_count nodegroups aws eks list-nodegroups --cluster-name "$STATE_CLUSTER" --region "$STATE_REGION" --query 'length(nodegroups)' --output text
-  inventory_count ec2 aws ec2 describe-instances --region "$STATE_REGION" --filters "Name=tag:alpha.eksctl.io/cluster-name,Values=$STATE_CLUSTER" --query 'length(Reservations[].Instances[])' --output text
+  if (( cluster_absent == 1 )); then
+    inventory+='nodegroups=0'$'\n'
+  else
+    inventory_count nodegroups aws eks list-nodegroups --cluster-name "$STATE_CLUSTER" --region "$STATE_REGION" --query 'length(nodegroups)' --output text
+  fi
+  inventory_count ec2 aws ec2 describe-instances --region "$STATE_REGION" --filters "Name=tag:alpha.eksctl.io/cluster-name,Values=$STATE_CLUSTER" --query "length(Reservations[].Instances[?State.Name != 'terminated'][])" --output text
   inventory_count asg aws autoscaling describe-auto-scaling-groups --region "$STATE_REGION" --query "length(AutoScalingGroups[?contains(AutoScalingGroupName, '$STATE_CLUSTER')])" --output text
-  # list-stacks omits DELETE_COMPLETE by default, so failed deletion states count.
-  inventory_count cloudformation aws cloudformation list-stacks --region "$STATE_REGION" --query "length(StackSummaries[?contains(StackName, '$STATE_CLUSTER')])" --output text
+  inventory_count cloudformation aws cloudformation list-stacks --region "$STATE_REGION" --query "length(StackSummaries[?contains(StackName, '$STATE_CLUSTER') && StackStatus != 'DELETE_COMPLETE'])" --output text
   inventory_count ebs aws ec2 describe-volumes --region "$STATE_REGION" --filters "Name=tag:alpha.eksctl.io/cluster-name,Values=$STATE_CLUSTER" --query 'length(Volumes)' --output text
   inventory_count elb aws elbv2 describe-load-balancers --region "$STATE_REGION" --query "length(LoadBalancers[?contains(LoadBalancerName, '$STATE_CLUSTER')])" --output text
-  inventory_count nat aws ec2 describe-nat-gateways --region "$STATE_REGION" --filter "Name=tag:alpha.eksctl.io/cluster-name,Values=$STATE_CLUSTER" --query 'length(NatGateways)' --output text
+  inventory_count nat aws ec2 describe-nat-gateways --region "$STATE_REGION" --filter "Name=tag:alpha.eksctl.io/cluster-name,Values=$STATE_CLUSTER" --query "length(NatGateways[?State != 'deleted'])" --output text
   inventory_count eip aws ec2 describe-addresses --region "$STATE_REGION" --filters "Name=tag:alpha.eksctl.io/cluster-name,Values=$STATE_CLUSTER" --query 'length(Addresses)' --output text
   inventory+='ecr=lifecycle-managed'$'\n'
   printf '%s' "$inventory"

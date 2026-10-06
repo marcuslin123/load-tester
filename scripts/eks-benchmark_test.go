@@ -652,6 +652,22 @@ func TestEKSBenchmarkDeadlineTerminatesTheActiveClusterCommandBeforeTeardown(t *
 	t.Logf("cluster deletion started %s after deadline signal; timestamped active-to-delete=%s; benchmark shell completed in %s; supervisor=%d", deleteStarted, eventElapsed(t, events, "eksctl create cluster", "eksctl delete cluster"), completionTime, supervisorPID)
 }
 
+func TestEKSBenchmarkClusterCreationHasDedicatedTimeoutWithinRunDeadline(t *testing.T) {
+	env := baseEKSEnvironment()
+	env["EKS_COMMAND_TIMEOUT_SECONDS"] = "1"
+	env["EKS_CLUSTER_CREATE_TIMEOUT_SECONDS"] = "5"
+	env["EKS_BENCHMARK_FAIL_PHASE"] = "readiness"
+	result := runEKSBenchmark(t, "run", env, map[string]string{
+		"EKS_FAKE_EKSCTL_CREATE_DELAY_SECONDS": "2",
+	})
+	if result.Status == 0 || !strings.Contains(result.Output, "simulated failure during readiness") {
+		t.Fatalf("status=%d output=%q, want cluster creation to complete before readiness failure", result.Status, result.Output)
+	}
+	if _, err := os.Stat(filepath.Join(result.Root, "fake-state", "eksctl-create-completed")); err != nil {
+		t.Fatalf("cluster creation did not outlive the generic command timeout: %v", err)
+	}
+}
+
 func TestEKSBenchmarkBoundsEveryBenchmarkHTTPCall(t *testing.T) {
 	parallelEKSBenchmarkTest(t)
 	result := runEKSBenchmark(t, "run", baseEKSEnvironment(), nil)
@@ -1014,7 +1030,11 @@ func TestEKSBenchmarkCleanupDetectsEachRemainingResourceCategory(t *testing.T) {
 			runDir := writeOwnedRunFixture(t, root, nil)
 			env := baseEKSEnvironment()
 			env["EKS_RUN_DIR"] = runDir
-			result := runEKSBenchmarkInRoot(t, "verify-cleanup", env, map[string]string{"EKS_LEFTOVER_CATEGORY": category}, root)
+			fixtures := map[string]string{"EKS_LEFTOVER_CATEGORY": category}
+			if category == "nodegroups" {
+				fixtures["EKS_CLUSTER_EXISTS"] = "1"
+			}
+			result := runEKSBenchmarkInRoot(t, "verify-cleanup", env, fixtures, root)
 			if result.Status == 0 || !strings.Contains(result.Output, category) {
 				t.Fatalf("category=%s status=%d output=%q", category, result.Status, result.Output)
 			}
@@ -1023,6 +1043,30 @@ func TestEKSBenchmarkCleanupDetectsEachRemainingResourceCategory(t *testing.T) {
 				t.Fatalf("cleanup report err=%v contents=%q", err, contents)
 			}
 		})
+	}
+}
+
+func TestEKSBenchmarkCleanupIgnoresTerminalAWSHistoryAndSkipsAbsentClusterNodegroups(t *testing.T) {
+	parallelEKSBenchmarkTest(t)
+	root := t.TempDir()
+	runDir := writeOwnedRunFixture(t, root, nil)
+	env := baseEKSEnvironment()
+	env["EKS_RUN_DIR"] = runDir
+	result := runEKSBenchmarkInRoot(t, "verify-cleanup", env, map[string]string{
+		"EKS_FAKE_TERMINAL_RESOURCE_HISTORY": "1",
+	}, root)
+	if result.Status != 0 {
+		t.Fatalf("terminal resource history failed cleanup verification: %s", result.Output)
+	}
+	assertCallAbsent(t, result.Calls, "aws eks list-nodegroups")
+	contents, err := os.ReadFile(filepath.Join(runDir, "cleanup-report.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"nodegroups": "0"`, `"ec2": "0"`, `"cloudformation": "0"`, `"nat": "0"`, `"status": "PASS"`} {
+		if !strings.Contains(string(contents), want) {
+			t.Errorf("cleanup report missing %s: %s", want, contents)
+		}
 	}
 }
 
@@ -1046,7 +1090,7 @@ func TestEKSBenchmarkCleanupInventoryFailsClosedOnAWSErrorsAndFailedStacks(t *te
 	parallelEKSBenchmarkTest(t)
 	for name, fixtures := range map[string]map[string]string{
 		"EKS error":            {"EKS_FAKE_AWS_ERROR_FOR": "eks-describe-cluster"},
-		"node group error":     {"EKS_FAKE_AWS_ERROR_FOR": "eks-list-nodegroups"},
+		"node group error":     {"EKS_FAKE_AWS_ERROR_FOR": "eks-list-nodegroups", "EKS_CLUSTER_EXISTS": "1"},
 		"EC2 error":            {"EKS_FAKE_AWS_ERROR_FOR": "ec2-describe-instances"},
 		"ASG error":            {"EKS_FAKE_AWS_ERROR_FOR": "autoscaling-describe-auto-scaling-groups"},
 		"CloudFormation error": {"EKS_FAKE_AWS_ERROR_FOR": "cloudformation-list-stacks"},
@@ -1637,6 +1681,20 @@ aws)
     printf '{"StackId":"arn:aws:cloudformation:us-west-2:123456789012:stack/%s/fake-id","Tags":%s}\n' "$stack_name" "$tags"
     exit 0
   fi
+  if [[ "${EKS_FAKE_TERMINAL_RESOURCE_HISTORY:-0}" == 1 ]]; then
+    if [[ "$*" == "ec2 describe-instances"* ]]; then
+      [[ "$*" == *"State.Name != 'terminated'"* ]] && printf '0\n' || printf '1\n'
+      exit 0
+    fi
+    if [[ "$*" == "cloudformation list-stacks"* ]]; then
+      [[ "$*" == *"StackStatus != 'DELETE_COMPLETE'"* ]] && printf '0\n' || printf '1\n'
+      exit 0
+    fi
+    if [[ "$*" == "ec2 describe-nat-gateways"* ]]; then
+      [[ "$*" == *"State != 'deleted'"* ]] && printf '0\n' || printf '1\n'
+      exit 0
+    fi
+  fi
   if [[ "$*" == "ecr"* || "$*" == "ec2"* || "$*" == "autoscaling"* || "$*" == "cloudformation"* || "$*" == "elbv2"* ]]; then
     category=${EKS_LEFTOVER_CATEGORY:-}
     if [[ ( "$category" == ec2 && "$*" == "ec2 describe-instances"* ) || ( "$category" == asg && "$*" == "autoscaling"* ) || ( "$category" == cloudformation && "$*" == "cloudformation"* ) || ( "$category" == ebs && "$*" == "ec2 describe-volumes"* ) || ( "$category" == elb && "$*" == "elbv2"* ) || ( "$category" == nat && "$*" == "ec2 describe-nat-gateways"* ) || ( "$category" == eip && "$*" == "ec2 describe-addresses"* ) ]]; then printf '1\n'; else printf '0\n'; fi
@@ -1669,6 +1727,12 @@ aws)
     printf 'completed\n' >"$EKS_FAKE_STATE_DIR/eksctl-terminated"
     exit 0
   fi
+	if [[ "$*" == "create cluster"* && "$*" != *"--dry-run"* && -n "${EKS_FAKE_EKSCTL_CREATE_DELAY_SECONDS:-}" ]]; then
+	  sleep "$EKS_FAKE_EKSCTL_CREATE_DELAY_SECONDS"
+	  printf 'completed\n' >"$EKS_FAKE_STATE_DIR/eksctl-create-completed"
+	  printf 'created\n' >"$EKS_FAKE_STATE_DIR/cluster-created"
+	  exit 0
+	fi
 	if [[ "$*" == "create cluster"* && "$*" != *"--dry-run"* && "${EKS_BENCHMARK_FAIL_PHASE:-}" == "cluster" ]]; then exit 1; fi
   exit 0
   ;;

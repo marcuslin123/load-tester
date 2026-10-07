@@ -884,6 +884,7 @@ func TestEKSBenchmarkCleanupTimeoutReapsTermIgnoringDescendant(t *testing.T) {
 	delete(env, "ALLOW_AWS_BILLING")
 	env["EKS_RUN_DIR"] = runDir
 	env["EKS_CLEANUP_COMMAND_TIMEOUT_SECONDS"] = "2"
+	env["EKS_CLUSTER_DELETE_TIMEOUT_SECONDS"] = "2"
 	env["EKS_PROCESS_TERMINATION_GRACE_SECONDS"] = "1"
 	command, callLog := startEKSBenchmarkInRoot(t, "teardown", env, map[string]string{
 		"EKS_FAKE_EKSCTL_DELETE_BLOCK":      "1",
@@ -935,9 +936,29 @@ func TestEKSBenchmarkCleanupTimeoutReapsTermIgnoringDescendant(t *testing.T) {
 	assertCallContains(t, readCalls(t, callLog), "eksctl delete cluster", "--wait")
 }
 
+func TestEKSBenchmarkClusterDeletionHasDedicatedCleanupTimeout(t *testing.T) {
+	root := t.TempDir()
+	runDir := writeOwnedRunFixture(t, root, nil)
+	env := baseEKSEnvironment()
+	delete(env, "ALLOW_AWS_BILLING")
+	env["EKS_RUN_DIR"] = runDir
+	env["EKS_CLEANUP_COMMAND_TIMEOUT_SECONDS"] = "1"
+	env["EKS_CLUSTER_DELETE_TIMEOUT_SECONDS"] = "5"
+	result := runEKSBenchmarkInRoot(t, "teardown", env, map[string]string{
+		"EKS_FAKE_EKSCTL_DELETE_DELAY_SECONDS": "2",
+	}, root)
+	if result.Status != 0 {
+		t.Fatalf("cluster deletion did not outlive the generic cleanup timeout: %s", result.Output)
+	}
+	if _, err := os.Stat(filepath.Join(root, "fake-state", "eksctl-delete-completed")); err != nil {
+		t.Fatalf("cluster deletion did not complete under its dedicated timeout: %v", err)
+	}
+}
+
 func TestEKSBenchmarkCleanupTimeoutFailsVerificationAfterDeletionAttempt(t *testing.T) {
 	env := baseEKSEnvironment()
 	env["EKS_CLEANUP_COMMAND_TIMEOUT_SECONDS"] = "1"
+	env["EKS_CLUSTER_DELETE_TIMEOUT_SECONDS"] = "1"
 	env["EKS_PROCESS_TERMINATION_GRACE_SECONDS"] = "1"
 	// Fail immediately after cluster creation so EXIT cleanup exercises the
 	// diagnostics-before-deletion path without running every benchmark scenario.
@@ -1705,6 +1726,11 @@ aws)
 	if [[ "$*" == "delete cluster"* && "${EKS_FAKE_REQUIRE_PORT_FORWARDS_STOPPED_BEFORE_CLEANUP:-0}" == 1 ]]; then
 	  markers="$EKS_FAKE_STATE_DIR/stopped-port-forwards"
 	  [[ -f "$markers" && $(grep -c '^stopped$' "$markers") -eq 2 ]] || { printf 'port-forwards remained active when cleanup began\n' >&2; exit 1; }
+	fi
+	if [[ "$*" == "delete cluster"* && -n "${EKS_FAKE_EKSCTL_DELETE_DELAY_SECONDS:-}" ]]; then
+	  sleep "$EKS_FAKE_EKSCTL_DELETE_DELAY_SECONDS"
+	  printf 'completed\n' >"$EKS_FAKE_STATE_DIR/eksctl-delete-completed"
+	  exit 0
 	fi
 	if [[ "$*" == "delete cluster"* && "${EKS_FAKE_EKSCTL_DELETE_BLOCK:-0}" == 1 ]]; then
 		  if [[ "${EKS_FAKE_EKSCTL_DELETE_DESCENDANT:-0}" == 1 ]]; then

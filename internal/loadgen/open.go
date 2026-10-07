@@ -93,6 +93,9 @@ func runOpenWithContexts(
 	sequence := firstSequenceForShard(firstArrivalSequence(started, clock.Now(), schedule), options)
 	for {
 		intended := started.Add(arrivalOffset(sequence, schedule))
+		if deadline, ok := scheduleCtx.Deadline(); ok && !intended.Before(deadline) {
+			break
+		}
 		if !clock.WaitUntil(scheduleCtx, intended) || scheduleCtx.Err() != nil {
 			break
 		}

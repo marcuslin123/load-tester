@@ -133,6 +133,34 @@ func TestRunOpenUsesAbsoluteDeadlines(t *testing.T) {
 	}
 }
 
+func TestRunOpenExcludesArrivalAtContextDeadline(t *testing.T) {
+	t.Parallel()
+
+	started := time.Now().Add(time.Hour)
+	ctx, cancel := context.WithDeadline(context.Background(), started.Add(time.Second))
+	defer cancel()
+	clock := &scriptedClock{now: started, arrivals: 3, cancel: cancel}
+	sink := newOpenCountingSink()
+	executor := protocolFunc(func(context.Context) protocol.Result {
+		return protocol.Result{StatusCode: 200}
+	})
+
+	if err := runOpen(ctx, executor, sink, OpenOptions{
+		Rate:        2,
+		MaxInFlight: 10,
+		StartAt:     started,
+	}, clock); err != nil {
+		t.Fatalf("runOpen() error = %v", err)
+	}
+	if got := sink.admitted.Load(); got != 2 {
+		t.Fatalf("admitted arrivals = %d, want only deadlines in [start, context deadline)", got)
+	}
+	want := []time.Time{started, started.Add(500 * time.Millisecond)}
+	if got := clock.recordedDeadlines(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("scheduled deadlines = %v, want %v", got, want)
+	}
+}
+
 func TestRunOpenSkipsStaleDeadlinesInsteadOfBurstingToCatchUp(t *testing.T) {
 	t.Parallel()
 

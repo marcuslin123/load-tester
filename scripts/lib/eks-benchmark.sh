@@ -804,12 +804,18 @@ run_managed_command() {
 }
 
 # Cleanup commands may run after the benchmark deadline, but each is bounded.
-run_cleanup_command() {
-  if run_bounded_command "${EKS_CLEANUP_COMMAND_TIMEOUT_SECONDS:-300}" cleanup "$@"; then
+run_cleanup_command_with_timeout() {
+  local timeout=$1
+  shift
+  if run_bounded_command "$timeout" cleanup "$@"; then
     return 0
   fi
   CLEANUP_COMMAND_FAILED=1
   return 1
+}
+
+run_cleanup_command() {
+  run_cleanup_command_with_timeout "${EKS_CLEANUP_COMMAND_TIMEOUT_SECONDS:-300}" "$@"
 }
 
 # Cleanup inventory treats a missing resource as data, not a deletion error.
@@ -1395,7 +1401,7 @@ delete_exposed_kubernetes_resources() {
 
 delete_owned_cluster() {
   CLUSTER_DELETE_ATTEMPTED=1
-  run_cleanup_command eksctl delete cluster --name "$STATE_CLUSTER" --region "$STATE_REGION" --wait
+  run_cleanup_command_with_timeout "${EKS_CLUSTER_DELETE_TIMEOUT_SECONDS:-1200}" eksctl delete cluster --name "$STATE_CLUSTER" --region "$STATE_REGION" --wait
 }
 
 inventory_remaining_resources() {

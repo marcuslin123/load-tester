@@ -1153,6 +1153,30 @@ func TestEKSBenchmarkRunUsesWholeExperimentPrometheusRangesAndSavesRawEvidence(t
 	}
 }
 
+func TestEKSBenchmarkRunReadsCompletedJobCountersFromRecentPrometheusHistory(t *testing.T) {
+	parallelEKSBenchmarkTest(t)
+	result := runEKSBenchmark(t, "run", baseEKSEnvironment(), map[string]string{"EKS_FAKE_STALE_COMPLETED_JOB_COUNTERS": "1"})
+	if result.Status != 0 {
+		t.Fatalf("run failed after completed Job series became stale: %s", result.Output)
+	}
+	assertCallContains(t, result.Calls, "curl ", `query=max\(max_over_time\(loadtester_dropped_samples_total\[5m\]\)\)`, "/api/v1/query")
+	assertCallContains(t, result.Calls, "curl ", `query=max\(max_over_time\(loadtester_unmet_demand_total\[5m\]\)\)`, "/api/v1/query")
+	for _, name := range []string{"prometheus-worker-baseline-dropped.json", "prometheus-worker-baseline-unmet.json"} {
+		contents, err := os.ReadFile(filepath.Join(latestRunDir(t, result.Root), name))
+		if err != nil || !strings.Contains(string(contents), `"value":["0","0"]`) {
+			t.Fatalf("missing zero-valued historical counter evidence %s: err=%v contents=%q", name, err, contents)
+		}
+	}
+}
+
+func TestEKSBenchmarkRunRejectsMissingCompletedJobCounterHistory(t *testing.T) {
+	parallelEKSBenchmarkTest(t)
+	result := runEKSBenchmark(t, "run", baseEKSEnvironment(), map[string]string{"EKS_FAKE_MISSING_COMPLETED_JOB_COUNTER_HISTORY": "1"})
+	if result.Status == 0 || !strings.Contains(result.Output, "Prometheus query returned no sample") {
+		t.Fatalf("status=%d output=%q", result.Status, result.Output)
+	}
+}
+
 func TestEKSBenchmarkRunRequiresHumanReviewedDashboardInsteadOfGrafanaRenderAPI(t *testing.T) {
 	parallelEKSBenchmarkTest(t)
 	env := baseEKSEnvironment()
@@ -1822,6 +1846,10 @@ curl)
       printf 'fake Grafana endpoint became unreachable\n' >&2
       exit 7
     fi
+	elif [[ "${EKS_FAKE_MISSING_COMPLETED_JOB_COUNTER_HISTORY:-0}" == 1 && "$*" == *"/api/v1/query"* && "$*" != *"/api/v1/query_range"* && ( "$*" == *loadtester_dropped_samples_total* || "$*" == *loadtester_unmet_demand_total* ) ]]; then
+	  printf '{"data":{"result":[]}}\n'
+	elif [[ "${EKS_FAKE_STALE_COMPLETED_JOB_COUNTERS:-0}" == 1 && "$*" == *"/api/v1/query"* && "$*" != *"/api/v1/query_range"* && "$*" != *max_over_time* && ( "$*" == *loadtester_dropped_samples_total* || "$*" == *loadtester_unmet_demand_total* ) ]]; then
+	  printf '{"data":{"result":[]}}\n'
   elif [[ "$*" == *"/api/v1/query_range"* ]]; then
     value=1
     case "$*" in

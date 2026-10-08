@@ -1015,8 +1015,8 @@ run_worker_experiment() {
   PROMETHEUS_PHASE=worker-calibration
   baseline_rps=$(prometheus_value worker-baseline-rps 'sum(rate(loadtester_requests_total[30s]))')
   baseline_errors=$(prometheus_value worker-baseline-errors 'sum(rate(loadtester_request_failures_total[30s])) / clamp_min(sum(rate(loadtester_requests_total[30s])), 1e-9)')
-  baseline_dropped=$(prometheus_value worker-baseline-dropped 'loadtester_dropped_samples_total')
-  baseline_unmet=$(prometheus_value worker-baseline-unmet 'loadtester_unmet_demand_total')
+  baseline_dropped=$(prometheus_value worker-baseline-dropped 'max(max_over_time(loadtester_dropped_samples_total[5m]))')
+  baseline_unmet=$(prometheus_value worker-baseline-unmet 'max(max_over_time(loadtester_unmet_demand_total[5m]))')
   unset PROMETHEUS_PHASE
   assert_metric "$baseline_rps" gt 0 'worker calibration throughput'
   assert_metric "$baseline_errors" eq 0 'worker calibration /echo error rate'

@@ -403,6 +403,7 @@ def _experiment_lines(title: str, experiment: object) -> list[str]:
         "target_replicas",
         "error_rate",
         "dropped_samples",
+        "missed_arrivals_during_scale_up",
         "unmet_demand",
     )
     measured_summary = ", ".join(

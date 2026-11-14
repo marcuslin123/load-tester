@@ -66,7 +66,9 @@ Stage 2 billable operations and require `ALLOW_AWS_BILLING=1`.
 autoscaling against `/echo`, then an isolated target-HPA experiment against
 `/burn?ms=20`. It uses the open `constant-rate` model. Rates are calibrated from
 the measured run rather than selected for a resume claim. A clean evidence run
-has no request errors, dropped samples, or unmet demand.
+has no request errors or dropped samples. The worker experiment reports missed
+arrivals before recovery and requires zero unmet demand after recovery.
+Calibration and the target HPA experiment require zero unmet demand.
 
 ## Dashboard Approval
 
@@ -95,7 +97,7 @@ docs/benchmarks/eks/<run-id>/
 The redactor removes account IDs, ARNs, IPs, emails, and credential-like data.
 `acknowledge-billing` records your human billing attestation exactly one calendar
 day after the run and publishes the curated bundle. It rejects any nonzero error
-rate, dropped sample, unmet demand, or evidence whose run ID, Git SHA, region, or
+rate, dropped sample, post-recovery unmet demand, or evidence whose run ID, Git SHA, region, or
 cleanup identity does not exactly match the owned raw run. Do not update the
 README or Piece 24B until that measured bundle exists.
 

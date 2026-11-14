@@ -1826,7 +1826,17 @@ kubectl)
   fi
   if [[ "$*" == "version --output json"* ]]; then printf '{"serverVersion":{"gitVersion":"v1.34.1"}}\n'; exit 0; fi
   if [[ "$*" == "get nodes"*"load-tester.io/pool=loadgen"* || "$*" == "get nodes"*"load-tester.io/pool=platform"* ]]; then printf 'node-a Ready\nnode-b Ready\n'; exit 0; fi
-  if [[ "$*" == "logs job/load-tester-orchestrator"* ]]; then printf 'Result: PASS\n'; fi
+  if [[ "$*" == "get job/load-tester-orchestrator"* ]]; then printf 'Failed'; fi
+  if [[ "$*" == "logs job/load-tester-orchestrator"* ]]; then
+    if [[ "${EKS_FAKE_WORKER_NEEDS_MORE_LOAD:-0}" == 1 && ! -f "$EKS_FAKE_STATE_DIR/worker-peak-queried" ]]; then
+      printf 'Test: eks-worker-autoscale\nResult: FAIL\nFailed: 0\nUnmet demand: 1\nDropped samples: 0\nViolations:\n- unmet demand: 1\n'
+    else
+      printf '%s\n' \
+        'autoscale evaluation: expected=100 admitted=75 unmet=0 coverage=0.7500 complete=true deficits=0 desired=2 registered=1 scale=true reason="scale applied"' \
+        'autoscale evaluation: expected=100 admitted=100 unmet=0 coverage=1.0000 complete=true deficits=0 desired=2 registered=2 scale=false reason="recovered"'
+      printf 'Test: eks-worker-autoscale\nResult: FAIL\nFailed: 0\nUnmet demand: 25\nDropped samples: 0\nViolations:\n- unmet demand: 25\n'
+    fi
+  fi
   exit 0
   ;;
 kustomize)

@@ -40,6 +40,7 @@ WORKER_PEAK_WORKERS=''
 WORKER_ERROR_RATE=''
 WORKER_DROPPED_SAMPLES=''
 WORKER_UNMET_DEMAND=''
+WORKER_MISSED_DURING_SCALE_UP=''
 HPA_PEAK_RPS=''
 HPA_P50_MS=''
 HPA_P95_MS=''
@@ -890,6 +891,20 @@ run_orchestrator_job() {
   run_managed_command kubectl delete job/load-tester-orchestrator --namespace "$NAMESPACE" --ignore-not-found --wait=true
   run_managed_command kubectl apply -f "$CURRENT_STACK"
   run_managed_command kubectl patch job/load-tester-orchestrator --namespace "$NAMESPACE" --type merge -p '{"spec":{"suspend":false}}'
+  if [[ "$phase" == worker-evidence ]]; then
+    local condition wait_until=$((SECONDS + 600))
+    while true; do
+      condition=$(run_managed_command kubectl get job/load-tester-orchestrator --namespace "$NAMESPACE" \
+        -o 'jsonpath={.status.conditions[?(@.status=="True")].type}')
+      case " $condition " in
+        *' Complete '*|*' Failed '*) break ;;
+      esac
+      (( SECONDS < wait_until )) || die "timed out waiting for worker experiment Job"
+      run_managed_sleep 2
+    done
+    run_managed_command kubectl logs job/load-tester-orchestrator --namespace "$NAMESPACE"
+    return
+  fi
   run_managed_command kubectl wait --for=condition=complete job/load-tester-orchestrator --namespace "$NAMESPACE" --timeout=10m
   run_managed_command kubectl logs job/load-tester-orchestrator --namespace "$NAMESPACE"
 }
@@ -1037,13 +1052,22 @@ if floor > ceiling:
 print(floor)
 PY
   ) || die "cannot derive worker evidence rate from calibration"
-  local attempt=1 coverage
+  local attempt=1 coverage recovery scaled recovered log
   while true; do
     install_scenario_config "$REPO_ROOT/deploy/eks/scenarios/worker-autoscale.yaml.tmpl" "$evidence" "$rate"
     cp "$evidence" "$RUN_DIR/scenarios/worker-autoscale-attempt-$attempt.yaml"
     begin_experiment_window
-    run_orchestrator_job worker-evidence
+    log="$RUN_DIR/worker-autoscale-attempt-$attempt.log"
+    run_orchestrator_job worker-evidence >"$log"
+    cat "$log"
     end_experiment_window
+    recovery="$RUN_DIR/worker-autoscale-attempt-$attempt.json"
+    python3 "$REPO_ROOT/scripts/eks-worker-recovery.py" <"$log" >"$recovery"
+    # Read the final reconciled report, including arrivals missed between the
+    # last Prometheus scrape and process exit.
+    read -r scaled recovered WORKER_MISSED_DURING_SCALE_UP WORKER_UNMET_DEMAND < <(
+      python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["scaled"],r["recovered"],r["missed_arrivals_during_scale_up"],r["unmet_demand"])' <"$recovery"
+    )
     WORKER_PEAK_RPS=$(prometheus_range_value worker-rps 'sum(rate(loadtester_requests_total[30s]))' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
     WORKER_P50_MS=$(prometheus_range_value worker-p50 'histogram_quantile(0.50, sum by (le) (rate(loadtester_request_duration_seconds_bucket[30s])))' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH" max 1000)
     WORKER_P95_MS=$(prometheus_range_value worker-p95 'histogram_quantile(0.95, sum by (le) (rate(loadtester_request_duration_seconds_bucket[30s])))' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH" max 1000)
@@ -1051,13 +1075,17 @@ PY
     WORKER_PEAK_WORKERS=$(prometheus_range_value worker-peak-workers 'loadtester_active_workers' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
     WORKER_ERROR_RATE=$(prometheus_range_value worker-error-rate 'sum(rate(loadtester_request_failures_total[30s])) / clamp_min(sum(rate(loadtester_requests_total[30s])), 1e-9)' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
     WORKER_DROPPED_SAMPLES=$(prometheus_range_value worker-dropped-samples 'loadtester_dropped_samples_total' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
-    WORKER_UNMET_DEMAND=$(prometheus_range_value worker-unmet-demand 'loadtester_unmet_demand_total' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
     coverage=$(prometheus_range_value worker-scheduler-coverage 'loadtester_autoscaler_scheduler_coverage_ratio' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH" last)
     assert_metric "$WORKER_PEAK_RPS" gt 0 'worker peak RPS'
     assert_metric "$WORKER_PEAK_WORKERS" le 4 'worker fleet upper bound'
-    assert_experiment_integrity 'worker /echo' "$WORKER_ERROR_RATE" "$WORKER_DROPPED_SAMPLES" "$WORKER_UNMET_DEMAND"
-    if assert_metric "$WORKER_PEAK_WORKERS" ge 2 'worker fleet scale-up' 2>/dev/null; then
+    assert_metric "$WORKER_ERROR_RATE" eq 0 'worker /echo error rate'
+    assert_metric "$WORKER_DROPPED_SAMPLES" eq 0 'worker /echo dropped samples'
+    if [[ "$scaled" == 1 ]]; then
+      assert_metric "$WORKER_PEAK_WORKERS" ge 2 'worker fleet scale-up'
+      [[ "$recovered" == 1 ]] || die "worker fleet scaled without a complete recovered scheduler window"
       assert_metric "$coverage" ge 0.9 'worker scheduler coverage recovery'
+      printf 'Worker fleet recovered. Missed arrivals before recovery: %s. Unmet demand after recovery: %s.\n' "$WORKER_MISSED_DURING_SCALE_UP" "$WORKER_UNMET_DEMAND"
+      assert_metric "$WORKER_UNMET_DEMAND" eq 0 'worker /echo post-recovery unmet demand'
       break
     fi
     (( attempt < 7 )) || die "worker fleet did not scale up after seven rate attempts"
@@ -1290,7 +1318,7 @@ collect_raw_evidence() {
   [[ -n "$WORKER_PEAK_RPS" && -n "$HPA_PEAK_RPS" ]] || die "experiments did not produce measured Prometheus evidence"
   collect_runtime_topology
   cat >"$RUN_DIR/metrics.json" <<EOF
-{"run_id":"$(basename "$RUN_DIR")","git_sha":"$GIT_SHA","region":"$AWS_REGION","topology":{"kubernetes_version":"$KUBERNETES_VERSION","eks_version":"$EKS_VERSION","instance_types":{"loadgen":"c7i.large","platform":"m7i.large"},"node_counts":{"loadgen":$LOADGEN_NODE_COUNT,"platform":$PLATFORM_NODE_COUNT}},"worker_experiment":{"scenario":{"target":"/echo","model":"constant-rate","duration":"3m"},"measured":{"peak_rps":$WORKER_PEAK_RPS,"p50_ms":$WORKER_P50_MS,"p95_ms":$WORKER_P95_MS,"p99_ms":$WORKER_P99_MS,"peak_workers":$WORKER_PEAK_WORKERS,"error_rate":$WORKER_ERROR_RATE,"dropped_samples":$WORKER_DROPPED_SAMPLES,"unmet_demand":$WORKER_UNMET_DEMAND}},"target_hpa_experiment":{"scenario":{"target":"/burn?ms=20","model":"constant-rate","duration":"2m"},"measured":{"peak_rps":$HPA_PEAK_RPS,"p50_ms":$HPA_P50_MS,"p95_ms":$HPA_P95_MS,"p99_ms":$HPA_P99_MS,"peak_workers":$HPA_PEAK_WORKERS,"target_replicas":$HPA_TARGET_REPLICAS,"error_rate":$HPA_ERROR_RATE,"dropped_samples":$HPA_DROPPED_SAMPLES,"unmet_demand":$HPA_UNMET_DEMAND}},"teardown":{"status":"PENDING","verified_clean":false},"billing_attestation":{"type":"pending","confirmed":false}}
+{"run_id":"$(basename "$RUN_DIR")","git_sha":"$GIT_SHA","region":"$AWS_REGION","topology":{"kubernetes_version":"$KUBERNETES_VERSION","eks_version":"$EKS_VERSION","instance_types":{"loadgen":"c7i.large","platform":"m7i.large"},"node_counts":{"loadgen":$LOADGEN_NODE_COUNT,"platform":$PLATFORM_NODE_COUNT}},"worker_experiment":{"scenario":{"target":"/echo","model":"constant-rate","duration":"3m"},"measured":{"peak_rps":$WORKER_PEAK_RPS,"p50_ms":$WORKER_P50_MS,"p95_ms":$WORKER_P95_MS,"p99_ms":$WORKER_P99_MS,"peak_workers":$WORKER_PEAK_WORKERS,"error_rate":$WORKER_ERROR_RATE,"dropped_samples":$WORKER_DROPPED_SAMPLES,"missed_arrivals_during_scale_up":$WORKER_MISSED_DURING_SCALE_UP,"unmet_demand":$WORKER_UNMET_DEMAND}},"target_hpa_experiment":{"scenario":{"target":"/burn?ms=20","model":"constant-rate","duration":"2m"},"measured":{"peak_rps":$HPA_PEAK_RPS,"p50_ms":$HPA_P50_MS,"p95_ms":$HPA_P95_MS,"p99_ms":$HPA_P99_MS,"peak_workers":$HPA_PEAK_WORKERS,"target_replicas":$HPA_TARGET_REPLICAS,"error_rate":$HPA_ERROR_RATE,"dropped_samples":$HPA_DROPPED_SAMPLES,"unmet_demand":$HPA_UNMET_DEMAND}},"teardown":{"status":"PENDING","verified_clean":false},"billing_attestation":{"type":"pending","confirmed":false}}
 EOF
   cp "$RUN_DIR/metrics.json" "$RUN_DIR/report.json"
   collect_human_reviewed_dashboard

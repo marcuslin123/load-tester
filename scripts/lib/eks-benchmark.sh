@@ -914,7 +914,7 @@ wait_for_prometheus_sample() {
 
 prometheus_value() {
   local label=$1 query=$2 scale=${3:-1} response output
-  response=$(query_prometheus "$query")
+  response=$(query_prometheus "$query") || die "cannot query Prometheus for $label"
   printf '%s\n' "$response" >"$RUN_DIR/prometheus-$label.json"
   output=$(python3 -c '
 import json
@@ -950,7 +950,7 @@ query_prometheus_range() {
 # Reduces samples across the recorded experiment window, never a final instant.
 prometheus_range_value() {
   local label=$1 query=$2 start=$3 end=$4 reducer=${5:-max} scale=${6:-1} response output
-  response=$(query_prometheus_range "$query" "$start" "$end")
+  response=$(query_prometheus_range "$query" "$start" "$end") || die "cannot query Prometheus range for $label"
   printf '%s\n' "$response" >"$RUN_DIR/prometheus-$label-range.json"
   output=$(python3 -c '
 import json
@@ -968,7 +968,7 @@ except (KeyError, IndexError, TypeError, ValueError) as exc:
     raise SystemExit(f"Prometheus range result has no numeric samples: {exc}")
 if not values or not all(math.isfinite(value) for value in values):
     raise SystemExit("Prometheus range result is empty or non-finite")
-reducers = {"max": max, "min": min}
+reducers = {"max": max, "min": min, "last": lambda samples: samples[-1]}
 if sys.argv[1] not in reducers:
     raise SystemExit("unsupported range reducer")
 print(format(reducers[sys.argv[1]](values) * scale, ".12g"))
@@ -1037,25 +1037,34 @@ if floor > ceiling:
 print(floor)
 PY
   ) || die "cannot derive worker evidence rate from calibration"
-  install_scenario_config "$REPO_ROOT/deploy/eks/scenarios/worker-autoscale.yaml.tmpl" "$evidence" "$rate"
-  begin_experiment_window
-  run_orchestrator_job worker-evidence
-  end_experiment_window
-  WORKER_PEAK_RPS=$(prometheus_range_value worker-rps 'sum(rate(loadtester_requests_total[30s]))' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
-  WORKER_P50_MS=$(prometheus_range_value worker-p50 'histogram_quantile(0.50, sum by (le) (rate(loadtester_request_duration_seconds_bucket[30s])))' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH" max 1000)
-  WORKER_P95_MS=$(prometheus_range_value worker-p95 'histogram_quantile(0.95, sum by (le) (rate(loadtester_request_duration_seconds_bucket[30s])))' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH" max 1000)
-  WORKER_P99_MS=$(prometheus_range_value worker-p99 'histogram_quantile(0.99, sum by (le) (rate(loadtester_request_duration_seconds_bucket[30s])))' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH" max 1000)
-  WORKER_PEAK_WORKERS=$(prometheus_range_value worker-peak-workers 'loadtester_active_workers' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
-  WORKER_ERROR_RATE=$(prometheus_range_value worker-error-rate 'sum(rate(loadtester_request_failures_total[30s])) / clamp_min(sum(rate(loadtester_requests_total[30s])), 1e-9)' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
-  WORKER_DROPPED_SAMPLES=$(prometheus_range_value worker-dropped-samples 'loadtester_dropped_samples_total' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
-  WORKER_UNMET_DEMAND=$(prometheus_range_value worker-unmet-demand 'loadtester_unmet_demand_total' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
-  local coverage
-  coverage=$(prometheus_value worker-scheduler-coverage 'loadtester_autoscaler_scheduler_coverage_ratio')
-  assert_metric "$WORKER_PEAK_RPS" gt 0 'worker peak RPS'
-  assert_metric "$WORKER_PEAK_WORKERS" ge 2 'worker fleet scale-up'
-  assert_metric "$WORKER_PEAK_WORKERS" le 4 'worker fleet upper bound'
-  assert_metric "$coverage" ge 0.9 'worker scheduler coverage recovery'
-  assert_experiment_integrity 'worker /echo' "$WORKER_ERROR_RATE" "$WORKER_DROPPED_SAMPLES" "$WORKER_UNMET_DEMAND"
+  local attempt=1 coverage
+  while true; do
+    install_scenario_config "$REPO_ROOT/deploy/eks/scenarios/worker-autoscale.yaml.tmpl" "$evidence" "$rate"
+    cp "$evidence" "$RUN_DIR/scenarios/worker-autoscale-attempt-$attempt.yaml"
+    begin_experiment_window
+    run_orchestrator_job worker-evidence
+    end_experiment_window
+    WORKER_PEAK_RPS=$(prometheus_range_value worker-rps 'sum(rate(loadtester_requests_total[30s]))' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
+    WORKER_P50_MS=$(prometheus_range_value worker-p50 'histogram_quantile(0.50, sum by (le) (rate(loadtester_request_duration_seconds_bucket[30s])))' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH" max 1000)
+    WORKER_P95_MS=$(prometheus_range_value worker-p95 'histogram_quantile(0.95, sum by (le) (rate(loadtester_request_duration_seconds_bucket[30s])))' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH" max 1000)
+    WORKER_P99_MS=$(prometheus_range_value worker-p99 'histogram_quantile(0.99, sum by (le) (rate(loadtester_request_duration_seconds_bucket[30s])))' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH" max 1000)
+    WORKER_PEAK_WORKERS=$(prometheus_range_value worker-peak-workers 'loadtester_active_workers' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
+    WORKER_ERROR_RATE=$(prometheus_range_value worker-error-rate 'sum(rate(loadtester_request_failures_total[30s])) / clamp_min(sum(rate(loadtester_requests_total[30s])), 1e-9)' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
+    WORKER_DROPPED_SAMPLES=$(prometheus_range_value worker-dropped-samples 'loadtester_dropped_samples_total' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
+    WORKER_UNMET_DEMAND=$(prometheus_range_value worker-unmet-demand 'loadtester_unmet_demand_total' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH")
+    coverage=$(prometheus_range_value worker-scheduler-coverage 'loadtester_autoscaler_scheduler_coverage_ratio' "$EXPERIMENT_START_EPOCH" "$EXPERIMENT_END_EPOCH" last)
+    assert_metric "$WORKER_PEAK_RPS" gt 0 'worker peak RPS'
+    assert_metric "$WORKER_PEAK_WORKERS" le 4 'worker fleet upper bound'
+    assert_experiment_integrity 'worker /echo' "$WORKER_ERROR_RATE" "$WORKER_DROPPED_SAMPLES" "$WORKER_UNMET_DEMAND"
+    if assert_metric "$WORKER_PEAK_WORKERS" ge 2 'worker fleet scale-up' 2>/dev/null; then
+      assert_metric "$coverage" ge 0.9 'worker scheduler coverage recovery'
+      break
+    fi
+    (( attempt < 7 )) || die "worker fleet did not scale up after seven rate attempts"
+    rate=$((rate * 2))
+    ((attempt += 1))
+    printf 'Worker fleet stayed at one worker. Retrying at %s RPS.\n' "$rate"
+  done
 }
 
 run_hpa_experiment() {

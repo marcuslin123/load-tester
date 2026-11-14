@@ -700,6 +700,27 @@ func TestEKSBenchmarkWorkerEvidenceRateDerivesFromCleanCalibration(t *testing.T)
 	}
 }
 
+func TestEKSBenchmarkWorkerRetriesCleanSingleWorkerRunAndReadsHistoricalCoverage(t *testing.T) {
+	parallelEKSBenchmarkTest(t)
+	result := runEKSBenchmark(t, "run", baseEKSEnvironment(), map[string]string{
+		"EKS_FAKE_WORKER_NEEDS_MORE_LOAD": "1",
+	})
+	if result.Status != 0 {
+		t.Fatalf("run failed: %s", result.Output)
+	}
+	runDir := latestRunDir(t, result.Root)
+	for name, want := range map[string]string{
+		"scenarios/worker-autoscale-attempt-1.yaml":       "rate: 157\n",
+		"scenarios/worker-autoscale-attempt-2.yaml":       "rate: 314\n",
+		"prometheus-worker-scheduler-coverage-range.json": `["2","0.95"]`,
+	} {
+		data, err := os.ReadFile(filepath.Join(runDir, name))
+		if err != nil || !strings.Contains(string(data), want) {
+			t.Errorf("%s missing %q: data=%q err=%v", name, want, data, err)
+		}
+	}
+}
+
 func TestEKSBenchmarkTargetHPAIncreasesRateByFiftyPercentWhenCalibrationNeedsMorePressure(t *testing.T) {
 	parallelEKSBenchmarkTest(t)
 	result := runEKSBenchmark(t, "run", baseEKSEnvironment(), map[string]string{"EKS_HPA_REPLICAS_SEQUENCE": "2,3"})
@@ -1855,7 +1876,16 @@ curl)
     case "$*" in
       *loadtester_request_failures_total*|*loadtester_dropped_samples_total*|*loadtester_unmet_demand_total*) value=0 ;;
       *loadtester_autoscaler_scheduler_coverage_ratio*) value=0.95 ;;
-      *loadtester_active_workers*) [[ "${EKS_PROMETHEUS_PHASE:-}" == target-hpa ]] && value=2 || value=4 ;;
+      *loadtester_active_workers*)
+        if [[ "${EKS_PROMETHEUS_PHASE:-}" == target-hpa ]]; then
+          value=2
+        elif [[ "${EKS_FAKE_WORKER_NEEDS_MORE_LOAD:-0}" == 1 && ! -f "$EKS_FAKE_STATE_DIR/worker-peak-queried" ]]; then
+          : >"$EKS_FAKE_STATE_DIR/worker-peak-queried"
+          value=1
+        else
+          value=4
+        fi
+        ;;
       *kube_horizontalpodautoscaler_status_current_replicas*)
         if [[ "${EKS_PROMETHEUS_PHASE:-}" == target-hpa && -n "${EKS_HPA_REPLICAS_SEQUENCE:-}" ]]; then
           state="$EKS_FAKE_STATE_DIR/hpa-range-replica-query-count"
@@ -1893,7 +1923,7 @@ curl)
     value=1
     case "$*" in
       *loadtester_request_failures_total*|*loadtester_dropped_samples_total*|*loadtester_unmet_demand_total*) value=0 ;;
-      *loadtester_autoscaler_scheduler_coverage_ratio*) value=0.95 ;;
+      *loadtester_autoscaler_scheduler_coverage_ratio*) printf '{"data":{"result":[]}}\n'; exit 0 ;;
       *loadtester_active_workers*) [[ "${EKS_PROMETHEUS_PHASE:-}" == target-hpa ]] && value=2 || value=4 ;;
 	      *kube_horizontalpodautoscaler_status_current_replicas*)
 	        if [[ "${EKS_PROMETHEUS_PHASE:-}" == target-hpa && -n "${EKS_HPA_REPLICAS_SEQUENCE:-}" ]]; then

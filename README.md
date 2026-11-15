@@ -5,7 +5,9 @@ and measure HTTP traffic.
 
 **Stack:** Go · gRPC · Docker · Kubernetes · Prometheus · Grafana
 
-![Load Tester Overview dashboard](docs/images/load-tester-overview.png)
+![Load Tester Overview dashboard from the local Docker Compose demo](docs/images/load-tester-overview.png)
+
+*Grafana dashboard from the local Docker Compose demo.*
 
 ## Capabilities
 
@@ -75,8 +77,15 @@ Prometheus series, provisioned Grafana queries, and cleanup.
 
 ## Cloud Benchmark
 
-Local Docker Compose and kind validation are complete. The reproducible EKS
-benchmark and measured cloud results are tracked in Piece 23.
+On November 13, 2026 (Pacific time), the platform ran a live HTTP benchmark on
+AWS EKS in `us-west-2`. The three-minute attempt configured at 212 RPS averaged
+**194.32 requests per second**, including ramp-up, and completed **34,978
+successful requests** with **2 ms p95 latency**, zero request failures, zero
+dropped samples, and one unmet arrival.
+
+One worker handled the traffic. The run recorded no worker scale-up, and the
+target HPA experiment did not start. A separate AWS inventory check verified
+teardown. See the [run results and methodology](docs/eks-benchmark.md#latest-aws-run).
 
 ## Documentation
 

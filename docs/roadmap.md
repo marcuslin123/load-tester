@@ -718,11 +718,13 @@ the guarded `eksctl` topology, EKS overlays, ECR image workflow, redaction,
 ownership-tagged teardown, and offline fake-command tests. It creates no AWS
 resources and records no benchmark result.
 
-**Stage 2 — pending measured EKS run.** After manual account, SSO, budget, and
-billing setup, run the calibration-first benchmark, capture the approved
-dashboard, verify teardown, and complete the next-day billing check. Piece 23
-remains incomplete until the measured EKS run and next-day billing attestation
-exist. Piece 24B remains pending until it can cite that sanitized evidence.
+**Stage 2 — measured EKS run and verified teardown.** The latest live run
+completed calibration and two single-worker attempts. The 212 RPS attempt
+completed 34,978 requests with zero request failures and one unmet arrival.
+See the [AWS run results](eks-benchmark.md#latest-aws-run). Worker scale-up and
+the target HPA experiment remain incomplete on EKS. A full curated bundle still
+requires those experiments, an approved dashboard capture, and a next-day
+billing attestation.
 
 ### Piece 24 — README **(Phase 4 gate, Layer 1 done)**
 
@@ -736,12 +738,10 @@ This is the gate that closes Layer 1.
 `docker compose up`, and get a working test with dashboards, following only the
 README. The measured numbers are present with no placeholders left.
 
-Deliver Piece 24 in two passes. Piece 24A creates the concise README, local
-dashboard screenshot, architecture diagram, and verified Compose quickstart
-without estimated cloud results. Piece 24B follows Piece 23, replaces the pending
-benchmark note with measured EKS topology and results, and closes the Phase 4
-gate. Piece 24 remains incomplete until Piece 24B contains no placeholders or
-pending benchmark language.
+Piece 24A delivered the README, local dashboard screenshot, architecture
+diagram, and verified Compose quickstart. Piece 24B now records the measured
+EKS results and links to the runbook. The separate EKS scaling validation and
+curated evidence bundle remain open under Piece 23.
 
 **Teaches:** Technical writing, diagramming, documenting a known ceiling
 honestly.

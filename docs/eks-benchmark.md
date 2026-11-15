@@ -1,8 +1,34 @@
 # EKS Benchmark Runbook
 
-This guide runs the one disposable AWS validation session for Piece 23. Stage 1
-creates and tests the workflow locally. Stage 2 is still pending: it creates AWS
-resources, records measured results, then removes them.
+This guide documents the latest AWS run and the workflow for running a
+disposable EKS benchmark.
+
+## Latest AWS Run
+
+The November 13, 2026 Pacific-time run (November 14 UTC) tested commit
+`85154c0` on EKS 1.34 in `us-west-2`. Two `c7i.large` nodes hosted load
+generators and two `m7i.large` nodes hosted the target and benchmark services.
+Each scenario used a single worker and sent constant-rate HTTP traffic to
+`/echo`.
+
+| Scenario | Configured rate | Duration | Successful requests | Average throughput | p50 / p95 / p99 | Unmet arrivals |
+| --- | ---: | ---: | ---: | ---: | --- | ---: |
+| Worker calibration | 100 RPS | 90 s | 7,999 | 88.88 RPS | 1 / 1 / 1 ms | 0 |
+| Worker attempt 1 | 106 RPS | 3 min | 17,489 | 97.16 RPS | 1 / 1 / 1 ms | 0 |
+| Worker attempt 2 | 212 RPS | 3 min | 34,978 | 194.32 RPS | 1 / 2 / 2 ms | 1 |
+
+The final orchestrator reports recorded 60,466 successful requests across all
+three scenarios, with zero request failures and zero dropped samples.
+Average throughput includes ramp-up (20 seconds for calibration and 30 seconds
+for each worker attempt). Prometheus recorded a peak of 106 RPS and one active
+worker in attempt 1. Attempt 2 stopped at the job-result gate before Prometheus
+range collection, so its throughput and latency come from the final job report.
+
+The second attempt's final report recorded one missed scheduled arrival and
+failed the run's zero-unmet-demand check. The scheduler stayed at one worker.
+The run ended before the target HPA experiment and dashboard review. A separate
+cleanup verification passed after deletion and found zero benchmark cluster or
+supporting resources. The private ECR images remain under their lifecycle policy.
 
 ## Account Boundary
 
@@ -96,10 +122,11 @@ docs/benchmarks/eks/<run-id>/
 
 The redactor removes account IDs, ARNs, IPs, emails, and credential-like data.
 `acknowledge-billing` records your human billing attestation exactly one calendar
-day after the run and publishes the curated bundle. It rejects any nonzero error
-rate, dropped sample, post-recovery unmet demand, or evidence whose run ID, Git SHA, region, or
-cleanup identity does not exactly match the owned raw run. Do not update the
-README or Piece 24B until that measured bundle exists.
+day after the run and publishes the curated bundle. Publication requires zero
+request errors, dropped samples, and post-recovery unmet demand, along with
+matching run and cleanup identities. The latest run has a manually transcribed
+results summary above. A full curated bundle requires completed experiments,
+dashboard approval, verified cleanup, and the billing attestation.
 
 ## Teardown
 

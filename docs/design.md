@@ -933,8 +933,8 @@ is still demonstrated — on the target app, per §6.
 
 ### EKS benchmark — guarded cloud validation
 
-Piece 23 is calibration-first: it publishes only measurements from a clean EKS
-run, never a chosen concurrency headline. Two fixed `c7i.large` load-generation
+Piece 23 is calibration-first. The full evidence bundle requires completed
+experiments and a verified teardown. Two fixed `c7i.large` load-generation
 nodes and two fixed `m7i.large` platform nodes use private subnets across two AZs
 with one NAT gateway. Workers select the load-generation pool; the target,
 orchestrator, and monitoring select the platform pool. This separates generator
@@ -953,8 +953,10 @@ owned cluster and uses fail closed cleanup when deletion or inventory cannot be
 verified. A local run sentinel plus matching cloud ownership tags prevent an
 emergency teardown from targeting another cluster. The raw artifacts remain local
 and gitignored; only sanitized evidence can enter `docs/benchmarks/eks/` after a
-human-approved SHA-256 dashboard sidecar and next-day billing attestation. Stage
-1 is offline automation only; no AWS benchmark results exist yet.
+human-approved SHA-256 dashboard sidecar and next-day billing attestation. The
+latest live run measured HTTP performance with one worker and verified teardown.
+See the [AWS run results](eks-benchmark.md#latest-aws-run) for measurements and
+the status of the two scaling experiments.
 
 ### HTTP client — `net/http` with a tuned `Transport`
 
